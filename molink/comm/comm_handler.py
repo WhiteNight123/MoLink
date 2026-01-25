@@ -1,6 +1,7 @@
 import msgspec
 import json
 import io
+import time
 import torch
 import asyncio
 import traceback
@@ -79,6 +80,25 @@ class CommService(comm_pb2_grpc.CommService):
             virtual_engine = request.virtual_engine
             execute_model_req, intermediate_tensors, grpc_metadata = await self.input_queue[virtual_engine].get()
 
+            f = open('worker_trace.log', 'a')
+
+            is_prefill = execute_model_req.seq_group_metadata_list[0].is_prompt
+
+            cur_stage = ''
+            if is_prefill:
+                cur_stage = 'prefill'
+            else:
+                cur_stage = 'decode'
+
+            cur = time.time()
+            for seq_group_metadata in execute_model_req.seq_group_metadata_list:
+                cur_request_id = seq_group_metadata.request_id
+                print(f'request {cur_request_id} arrives at worker at {cur}', file = f)
+
+            print(f'{virtual_engine} recv at {time.time()}', file=f)
+            batch_size = len(execute_model_req.seq_group_metadata_list)
+            
+            
             # 将张量反序列化操作提交到线程池
             def process_tensors(intermediate_tensors):
                 temp = IntermediateTensors(tensors={})
@@ -95,7 +115,20 @@ class CommService(comm_pb2_grpc.CommService):
                     self.bind_executor._start_worker_execution_loop())
 
             async with self.pp_lock:
+                print(f'{virtual_engine} {batch_size} compute starts ({cur_stage}) at {time.time()}', file=f)
+                cur = time.time()
+                for seq_group_metadata in execute_model_req.seq_group_metadata_list:
+                    cur_request_id = seq_group_metadata.request_id
+                    print(f'request {cur_request_id} starts to compute ({cur_stage}) on worker at {cur}', file = f)
+                
                 pipeline_outputs = await self.bind_executor.driver_exec_model(execute_model_req, intermediate_tensors)
+                
+                torch.cuda.synchronize()
+                cur = time.time()
+                for seq_group_metadata in execute_model_req.seq_group_metadata_list:
+                    cur_request_id = seq_group_metadata.request_id
+                    print(f'request {cur_request_id} finishes computing ({cur_stage}) on worker at {cur}', file = f)
+                print(f'{virtual_engine} {batch_size} compute ends ({cur_stage}) at {time.time()}', file = f)
 
                 
             pipeline_outputs = pipeline_outputs[0]

@@ -2,6 +2,7 @@
 from typing import (Dict, List, Optional, Type, Union)
 import asyncio
 import torch
+import time
 from functools import partial
 from weakref import ReferenceType
 from vllm.config import VllmConfig
@@ -15,8 +16,13 @@ from vllm.outputs import PoolingRequestOutput, RequestOutput
 from vllm.sequence import ExecuteModelRequest
 from vllm.logger import init_logger
 from vllm.utils import weak_bind
-from vllm.sampling_params import SamplingParams
-from vllm.sequence import SequenceGroupMetadata, SequenceStage
+from vllm.sampling_params import RequestOutputKind, SamplingParams
+from vllm.sequence import (SequenceGroupMetadata, SequenceStage, SequenceGroupOutput,
+                           SequenceGroup)
+from vllm.engine.output_processor.util import create_output_by_sequence_group
+from vllm.model_executor.layers.sampler import SamplerOutput
+from vllm.outputs import (PoolingRequestOutput, RequestOutput,
+                          RequestOutputFactory)
 from molink.config import MolinkConfig, PipelineConfig
 from molink.executor.mp_distributed_executor import MolinkMultiprocessingDistributedExecutor
 from .arg_utils import MolinkEngineArgs
@@ -149,9 +155,29 @@ class _MolinkEngine(_AsyncLLMEngine):
             for sg in scheduler_outputs.scheduled_seq_groups:
                 record_seq_groups.append(sg)
                 
+            f = open('worker_trace.log', 'a')
+            cur = time.time()
+            for scheduled_seq_group in record_seq_groups:
+                request_id = scheduled_seq_group.seq_group.request_id
+                req_stage = scheduled_seq_group.seq_group.seqs[0].data._stage
+                print(f'request {request_id} is scheduled to run at {cur}', file = f)
+
+            f.close()
+                
             # Execute the model.
             outputs = await self.model_executor.execute_model_async(
                 execute_model_req)
+            
+            f = open('worker_trace.log', 'a')
+            cur = time.time()
+            for scheduled_seq_group in record_seq_groups:
+                request_id = scheduled_seq_group.seq_group.request_id
+                req_stage = scheduled_seq_group.seq_group.seqs[0].data._stage
+                print(f'request {request_id} finished an iteration at {cur}', file = f)
+                if req_stage == SequenceStage.PREFILL:
+                    print(f'request {request_id} got its first token at {cur}', file = f)
+
+            f.close()
             
             scheduler_outputs.scheduled_seq_groups = []
             scheduler_outputs.scheduled_seq_groups.extend(record_seq_groups)
@@ -335,6 +361,254 @@ class _MolinkEngine(_AsyncLLMEngine):
         #print('Decode latency stats: ')
         #for group, latency in self.profile_data['decode'].items():
         #    print(group, latency)
+        
+    def _process_model_outputs(self,
+                               ctx: SchedulerContext,
+                               request_id: Optional[str] = None) -> None:
+        """Apply the model output to the sequences in the scheduled seq groups
+        and return responses.
+
+        ctx: The virtual engine context to work on
+        request_id: If provided, then only this request is going to be processed
+        """
+
+        now = time.time()
+
+        if len(ctx.output_queue) == 0:
+            return None
+
+        # Get pending async postprocessor
+        if request_id:
+            # When we process only one request, no pop is required
+            # (since later we will process all of the rest)
+            (outputs, seq_group_metadata_list, scheduler_outputs, is_async,
+             is_last_step, is_first_step_output, skip) = ctx.output_queue[0]
+        else:
+            (outputs, seq_group_metadata_list, scheduler_outputs, is_async,
+             is_last_step, is_first_step_output,
+             skip) = ctx.output_queue.popleft()
+
+        # Sanity check
+        assert len(seq_group_metadata_list) == len(
+            scheduler_outputs.scheduled_seq_groups)
+
+        has_multiple_outputs: bool = len(outputs) > 1
+        outputs_by_sequence_group: List[List[SequenceGroupOutput]]
+        if has_multiple_outputs:
+            assert self.scheduler_config.is_multi_step or \
+                     self.speculative_config
+            # Organize outputs by [step][sequence group] instead of
+            # [sequence group][step].
+            if self.scheduler_config.is_multi_step:
+                outputs_by_sequence_group = create_output_by_sequence_group(
+                    outputs, len(seq_group_metadata_list))
+            elif self.speculative_config:
+                # Decodes are multi-steps while prefills are not, outputting at
+                # most 1 token. Separate them so that we can trigger chunk
+                # processing without having to pad or copy over prompts K times
+                # to match decodes structure (costly with prompt_logprobs).
+                num_prefills = sum(sg.is_prompt
+                                   for sg in seq_group_metadata_list)
+                prefills, decodes = outputs[:num_prefills], outputs[
+                    num_prefills:]
+                outputs_by_sequence_group = create_output_by_sequence_group(
+                    decodes,
+                    num_seq_groups=len(seq_group_metadata_list) - num_prefills)
+                outputs_by_sequence_group = [p.outputs for p in prefills
+                                             ] + outputs_by_sequence_group
+            # We have outputs for multiple steps submitted in a single burst,
+            # so invalidate is_first_step_output.
+            is_first_step_output = None
+        else:
+            outputs_by_sequence_group = outputs
+
+        # Determine the requests we need to operate on
+        if request_id:
+            indices = []
+            for i, seq_group_meta in enumerate(seq_group_metadata_list):
+                if seq_group_meta.request_id == request_id:
+                    assert i not in skip  # Cannot be called twice
+                    indices.append(i)
+                    break
+
+            # If the request_id was not found, then it means that
+            # this is a new request that has no pending async
+            # postprocessor
+            if not indices:
+                return
+        else:
+            indices = range(len(seq_group_metadata_list))  # type: ignore
+
+        finished_before: List[int] = []
+        finished_now: List[int] = []
+        
+        # ************************************
+        f = open('worker_trace.log', 'a')
+        cur_time = time.time()
+        # ************************************
+        for i in indices:
+            if i in skip:
+                continue
+
+            seq_group_meta = seq_group_metadata_list[i]
+            scheduled_seq_group = scheduler_outputs.scheduled_seq_groups[i]
+
+            seq_group: SequenceGroup = scheduled_seq_group.seq_group
+
+            if seq_group.is_finished():
+                finished_before.append(i)
+                continue
+
+            output: List[SequenceGroupOutput]
+            if has_multiple_outputs:
+                output = outputs_by_sequence_group[i]
+            else:
+                output = [outputs_by_sequence_group[0][i]]
+
+            if not is_async:
+                if self.scheduler_config.is_multi_step:
+                    # Updates happen only if the sequence is prefill
+                    self._update_num_computed_tokens_for_multi_step_prefill(
+                        seq_group, seq_group_meta, is_first_step_output)
+                else:
+                    seq_group.update_num_computed_tokens(
+                        seq_group_meta.token_chunk_size or 0)
+
+            if outputs:
+                for o in outputs:
+                    if (isinstance(o, SamplerOutput)
+                            and seq_group.metrics is not None):
+                        if seq_group.metrics.model_forward_time is not None:
+                            seq_group.metrics.model_forward_time += (
+                                o.model_forward_time or 0)
+                        else:
+                            seq_group.metrics.model_forward_time = (
+                                o.model_forward_time)
+                        if seq_group.metrics.model_execute_time is not None:
+                            seq_group.metrics.model_execute_time += (
+                                o.model_execute_time or 0)
+                        else:
+                            seq_group.metrics.model_execute_time = (
+                                o.model_execute_time)
+
+            if self.model_config.runner_type == "pooling":
+                self._process_sequence_group_outputs(seq_group, output)
+            else:
+                self.output_processor.process_prompt_logprob(seq_group, output)
+                if seq_group_meta.do_sample:
+                    self.output_processor.process_outputs(
+                        seq_group, output, is_async)
+
+            if seq_group.is_finished():
+                print(f'request {seq_group.request_id} finished at {cur_time}', file = f)
+                print(f'request {seq_group.request_id} total token num is {len(seq_group.seqs[0].data._output_token_ids)}', file = f)
+                finished_now.append(i)
+
+        # ************************************
+        num_finished = len(finished_now)
+        if num_finished > 0:
+            print(f'{num_finished} requests finished at {cur_time}', file = f)
+        f.close()
+
+        # Generate outputs for the requests that finished this iteration
+        for i in finished_now:
+            scheduled_seq_group = scheduler_outputs.scheduled_seq_groups[i]
+
+            seq_group = scheduled_seq_group.seq_group
+            seq_group.maybe_set_first_token_time(now)
+            if not seq_group.is_prefill():
+                seq_group.set_last_token_time(now)
+            request_output = RequestOutputFactory.create(
+                seq_group,
+                self.seq_id_to_seq_group,
+                use_cache=self.use_cached_outputs)
+            if request_output:
+                ctx.request_outputs.append(request_output)
+
+        # When we process a single request, we skip it for the next time,
+        # and invoke the request output callback (if there was final output)
+        if request_id:
+            assert len(indices) == 1
+            skip.append(indices[0])
+
+            if (finished_now
+                    and self.process_request_outputs_callback is not None):
+                self.process_request_outputs_callback(ctx.request_outputs)
+                ctx.request_outputs.clear()
+            return
+
+        # Free currently finished requests
+        if finished_now:
+            for scheduler in self.scheduler:
+                scheduler.free_finished_seq_groups()
+
+        # For multi-step without streaming, don't create outputs each iteration
+        if not is_last_step and not ctx.multi_step_stream_outputs:
+            # Immediately process request outputs here (if callback is given)
+            if (finished_now
+                    and self.process_request_outputs_callback is not None):
+                self.process_request_outputs_callback(ctx.request_outputs)
+                ctx.request_outputs.clear()
+            return
+
+        # Create the outputs
+        for i in indices:
+            if i in skip or i in finished_before or i in finished_now:
+                continue  # Avoids double processing
+
+            scheduled_seq_group = scheduler_outputs.scheduled_seq_groups[i]
+
+            seq_group = scheduled_seq_group.seq_group
+            seq_group.maybe_set_first_token_time(now)
+            if not seq_group.is_prefill():
+                seq_group.set_last_token_time(now)
+            request_output = RequestOutputFactory.create(
+                seq_group,
+                self.seq_id_to_seq_group,
+                use_cache=self.use_cached_outputs)
+            if request_output:
+                ctx.request_outputs.append(request_output)
+
+        # For multi-step with streaming, create outputs each iteration
+        if not is_last_step and ctx.multi_step_stream_outputs:
+            # Immediately process request outputs here (if callback is given)
+            if self.process_request_outputs_callback is not None:
+                self.process_request_outputs_callback(ctx.request_outputs)
+                ctx.request_outputs.clear()
+            return
+
+        for seq_group in scheduler_outputs.ignored_seq_groups:
+            params = seq_group.sampling_params
+            if params is not None and params.output_kind == (
+                    RequestOutputKind.DELTA) and not seq_group.is_finished():
+                continue
+
+            request_output = RequestOutputFactory.create(
+                seq_group,
+                self.seq_id_to_seq_group,
+                use_cache=self.use_cached_outputs,
+            )
+            if request_output:
+                ctx.request_outputs.append(request_output)
+
+        # Immediately process request outputs here (if callback is given)
+        if (ctx.request_outputs
+                and self.process_request_outputs_callback is not None):
+            self.process_request_outputs_callback(ctx.request_outputs)
+            ctx.request_outputs.clear()
+
+        # For async case, we need to record the stats here.
+        # For non-async case, the stats are done in the
+        # LLMEngine/AsyncLLMEngine directly
+        if is_async:
+            # Log stats.
+            self.do_log_stats(scheduler_outputs, outputs, finished_before,
+                              skip)
+
+            # Tracing
+            self.do_tracing(scheduler_outputs, finished_before)
+
+        return None
 
 
 class MolinkEngine(AsyncLLMEngine):
@@ -548,6 +822,10 @@ class MolinkEngine(AsyncLLMEngine):
             self._request_tracker.get_new_and_aborted_requests())
 
         for new_request in new_requests:
+            f = open('worker_trace.log', 'a')
+            cur_req_id = new_request['request_id']
+            print(f'request {cur_req_id} is added at {time.time()}', file = f)
+            f.close()
             # Add the request into the vLLM engine's waiting queue.
             try:
                 await self.engine.add_request_async(**new_request)

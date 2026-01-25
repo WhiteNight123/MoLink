@@ -16,6 +16,8 @@ import asyncio
 import pickle
 import threading
 import traceback
+import time
+import os
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 import cloudpickle
@@ -36,6 +38,7 @@ from molinkv1.utils import (
 from .parallel_state import (
     init_molink_parallel_state,
     destroy_molink_parallel_state,
+    is_molink_last_stage,
 )
 from molinkv1.comm import molink_pb2, molink_pb2_grpc
 
@@ -534,6 +537,12 @@ class MolinkExecutor(MultiprocExecutor):
             # logger.info(
             #     f"[MoLink][VE{virtual_engine}][HEAD] Delivering {len(intermediate_tensors)} tensors to {next_server}"
             # )
+            # **********************instrument*****************************
+            server_id = os.environ.get('VLLM_SERVER_ID', '1')
+            f = open(f'server{server_id}.log', 'a')
+            print(f'{virtual_engine} trans starts at {time.time()}', file=f)
+            f.close()
+            # **********************instrument*****************************
             self.delivery_manager.deliver_to_next(
                 intermediate_tensors,
                 scheduler_output_bytes,
@@ -677,19 +686,29 @@ class MolinkExecutor(MultiprocExecutor):
             #     f"[MoLink][VE{virtual_engine}][WORKER_STEP] Pipeline has {len(server_list)} nodes"
             # )
 
-            # Find my position in pipeline
+            # Use MoLink's stage info instead of server_list matching
+            # This is more reliable as it uses the configured layer range
+            is_last_stage = is_molink_last_stage()
+            
+            # Find my position in pipeline (for next_server lookup if not last stage)
+            my_idx = -1
             try:
                 my_idx = server_list.index(self.grpc_address)
                 # logger.info(
                 #     f"[MoLink][VE{virtual_engine}][WORKER_STEP] My position in pipeline: {my_idx}"
                 # )
             except ValueError:
-                logger.error(
-                    f"[MoLink][VE{virtual_engine}][WORKER_STEP] Node {self.grpc_address} not found in server list: {server_list}"
-                )
-                return output
-
-            is_last_stage = my_idx == len(server_list) - 1
+                # If address not found, try to find by matching IP only (port may differ)
+                my_ip = self.grpc_address.split(':')[0] if self.grpc_address else ''
+                for idx, addr in enumerate(server_list):
+                    if addr.split(':')[0] == my_ip:
+                        my_idx = idx
+                        break
+                if my_idx == -1:
+                    logger.warning(
+                        f"[MoLink][VE{virtual_engine}][WORKER_STEP] Node {self.grpc_address} not found in server list: {server_list}, using MoLink stage info"
+                    )
+            
             # logger.info(
             #     f"[MoLink][VE{virtual_engine}][WORKER_STEP] Is last stage: {is_last_stage}"
             # )
@@ -717,7 +736,12 @@ class MolinkExecutor(MultiprocExecutor):
                     output_bytes = cloudpickle.dumps(
                         output, protocol=pickle.HIGHEST_PROTOCOL
                     )
-
+                # **********************instrument*****************************
+                server_id = os.environ.get('VLLM_SERVER_ID', '1')
+                f = open(f'server{server_id}.log', 'a')
+                print(f'{virtual_engine} trans starts at {time.time()}', file=f)
+                f.close()
+                # **********************instrument*****************************
                 self.delivery_manager.deliver_to_head(
                     output_bytes, virtual_engine, head_server
                 )
@@ -726,6 +750,14 @@ class MolinkExecutor(MultiprocExecutor):
                 # )
             else:
                 # Send intermediate tensors to next node
+                # Validate my_idx before accessing server_list
+                if my_idx < 0 or my_idx + 1 >= len(server_list):
+                    logger.error(
+                        f"[MoLink][VE{virtual_engine}][WORKER_STEP] Invalid pipeline index: my_idx={my_idx}, server_list_len={len(server_list)}. "
+                        f"Cannot determine next server. This may indicate a configuration issue."
+                    )
+                    return output
+                    
                 next_server = server_list[my_idx + 1]
                 # logger.info(
                 #     f"[MoLink][VE{virtual_engine}][WORKER_STEP] Intermediate stage, next server: {next_server}"
@@ -746,7 +778,15 @@ class MolinkExecutor(MultiprocExecutor):
                     # logger.info(
                     #     f"[MoLink][VE{virtual_engine}][WORKER_STEP] Wrapping output in hidden_states"
                     # )
-
+                    
+                # **********************instrument*****************************
+                
+                server_id = os.environ.get('VLLM_SERVER_ID', '1')
+                f = open(f'server{server_id}.log', 'a')
+                print(f'{virtual_engine} trans starts at {time.time()}', file=f)
+                f.close()
+                # **********************instrument*****************************
+                
                 # Serialize scheduler output for forwarding
                 # logger.info(
                 #     f"[MoLink][VE{virtual_engine}][WORKER_STEP] Delivering {len(intermediate)} tensors to {next_server}"

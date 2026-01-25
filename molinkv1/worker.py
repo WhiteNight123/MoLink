@@ -4,7 +4,7 @@ import gc
 import os
 from types import NoneType
 from typing import TYPE_CHECKING, Optional
-
+import time
 import torch
 from vllm.config import VllmConfig
 from vllm.distributed import (
@@ -169,6 +169,41 @@ class MolinkWorker(Worker):
     def execute_model(
         self, scheduler_output: "SchedulerOutput"
     ) -> ModelRunnerOutput | None:
+        
+        # **********************instrument*****************************
+        # 只在 driver worker (rank 0) 上记录日志，避免 TP workers 重复记录
+        # 同时检查 rank == 0 以确保只有主 worker 记录
+        _should_log = self.is_driver_worker and self.rank == 0
+        _log_file = None
+        _batch_size = 0
+        _cur_stage = ''
+        _virtual_engine = getattr(scheduler_output, 'virtual_engine', 0)
+        
+        if _should_log:
+            server_id = os.environ.get('VLLM_SERVER_ID', '1')
+            _log_file = open(f'server{server_id}.log', 'a')
+            
+            num_new_reqs = len(scheduler_output.scheduled_new_reqs)
+            num_old_reqs = len(scheduler_output.scheduled_cached_reqs.req_ids)
+            _batch_size = num_new_reqs + num_old_reqs
+            
+            if num_new_reqs == 0 and num_old_reqs > 0:
+                _cur_stage = 'decode'
+            elif num_new_reqs > 0 and num_old_reqs == 0:
+                _cur_stage = 'prefill'
+            else:
+                _cur_stage = 'mixed'
+            
+            torch.cuda.synchronize()
+            cur = time.time()
+            for new_reqs in scheduler_output.scheduled_new_reqs:
+                req_id = new_reqs.req_id
+                print(f'request {req_id} arrives at worker at {cur}', file=_log_file)
+
+            for old_req_id in scheduler_output.scheduled_cached_reqs.req_ids:
+                print(f'request {old_req_id} arrives at worker at {cur}', file=_log_file)
+        # **********************instrument*****************************
+        
         intermediate_tensors = None
         forward_pass = scheduler_output.total_num_scheduled_tokens > 0
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
@@ -206,12 +241,40 @@ class MolinkWorker(Worker):
                         all_gather_tensors=all_gather_tensors,
                     )
                 )
+        
+        # **********************instrument*****************************
+        if _should_log:
+            print(f'{_virtual_engine} {_batch_size} compute starts ({_cur_stage}) at {time.time()}', file=_log_file)
+            cur = time.time()
+            for new_reqs in scheduler_output.scheduled_new_reqs:
+                req_id = new_reqs.req_id
+                print(f'request {req_id} starts to compute ({_cur_stage}) on worker at {cur}', file=_log_file)
+
+            for old_req_id in scheduler_output.scheduled_cached_reqs.req_ids:
+                print(f'request {old_req_id} starts to compute ({_cur_stage}) on worker at {cur}', file=_log_file)
+        # **********************instrument*****************************
 
         with self.annotate_profile(scheduler_output):
             output = self.model_runner.execute_model(
                 scheduler_output, intermediate_tensors
             )
+            
+            # **********************instrument*****************************
+            if _should_log:
+                torch.cuda.synchronize()
+                cur = time.time()
+                for new_reqs in scheduler_output.scheduled_new_reqs:
+                    req_id = new_reqs.req_id
+                    print(f'request {req_id} finishes computing ({_cur_stage}) on worker at {cur}', file=_log_file)
+
+                for old_req_id in scheduler_output.scheduled_cached_reqs.req_ids:
+                    print(f'request {old_req_id} finishes computing ({_cur_stage}) on worker at {cur}', file=_log_file)
+                print(f'{_virtual_engine} {_batch_size} compute ends ({_cur_stage}) at {time.time()}', file=_log_file)
+            # **********************instrument*****************************
+            
             if isinstance(output, (ModelRunnerOutput, NoneType)):
+                if _should_log and _log_file:
+                    _log_file.close()
                 return output
 
         assert isinstance(output, IntermediateTensors)
@@ -225,12 +288,16 @@ class MolinkWorker(Worker):
                 # logger.info(
                 #     f"[MoLink][Worker] Last stage, returning None to trigger sampling"
                 # )
+                if _should_log and _log_file:
+                    _log_file.close()
                 return None
             else:
                 # Non-last stage: intermediate tensors will be sent via gRPC
                 # logger.info(
                 #     f"[MoLink][Worker] Intermediate stage, generated {len(output.tensors)} tensors, will be sent via gRPC"
                 # )
+                if _should_log and _log_file:
+                    _log_file.close()
                 return output
         else:
             # Standard NCCL pipeline parallel
@@ -244,7 +311,8 @@ class MolinkWorker(Worker):
                 all_gather_group=get_tp_group(),
                 all_gather_tensors=all_gather_tensors,
             )
-
+            if _should_log and _log_file:
+                _log_file.close()
             return None
 
 

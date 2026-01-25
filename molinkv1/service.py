@@ -4,7 +4,9 @@ MoLink gRPC service implementation for cross-node pipeline parallelism.
 
 import asyncio
 import io
+import os
 import traceback
+import time
 from typing import TYPE_CHECKING, Dict
 import torch
 from vllm.logger import init_logger
@@ -133,6 +135,14 @@ class MolinkService(molink_pb2_grpc.MolinkServiceServicer):
             # logger.info(
             #     f"[MoLink][VE{virtual_engine}][SERVICE] PushIntermediateTensors called"
             # )
+            
+            # **********************instrument*****************************
+            # 记录接收中间张量的时间 (server2 recv from server1)
+            server_id = os.environ.get('VLLM_SERVER_ID', '1')
+            f = open(f'server{server_id}.log', 'a')
+            print(f'{virtual_engine} recv at {time.time()}', file=f)
+            f.close()
+            # **********************instrument*****************************
 
             # Store raw bytes for deferred deserialization
             scheduler_output_bytes = request.scheduler_output
@@ -195,6 +205,14 @@ class MolinkService(molink_pb2_grpc.MolinkServiceServicer):
             # logger.info(
             #     f"[MoLink][VE{virtual_engine}][SERVICE] PushSamplerOutput called"
             # )
+            
+            # **********************instrument*****************************
+            # 记录头节点接收最终结果的时间 (server1 recv result from server2)
+            server_id = os.environ.get('VLLM_SERVER_ID', '1')
+            f = open(f'server{server_id}.log', 'a')
+            print(f'{virtual_engine} back to head at {time.time()}', file=f)
+            f.close()
+            # **********************instrument*****************************
 
             # Store raw bytes - will be deserialized by the executor
             output_bytes = request.output_data

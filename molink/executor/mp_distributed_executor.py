@@ -99,8 +99,12 @@ class MultiprocessingDeliver(mp.Process):
                 grpc_metadata=json.dumps(grpc_metadata).encode('utf-8'),
                 virtual_engine=virtual_engine
             )
+            f = open('worker_trace.log', 'a')
+            print(f'{virtual_engine} trans starts at {time.time()}', file = f)
             stub = comm_pb2_grpc.CommServiceStub(self.channel_to_next_server)
             await stub.PushIntermediateTensors(grpc_request_data)
+            print(f'{virtual_engine} trans ends at {time.time()}', file = f)
+            f.close()
             
         except Exception as e:
             print(f'Async transmit error: {e}')
@@ -418,9 +422,15 @@ class MolinkMultiprocessingDistributedExecutor(MultiprocessingDistributedExecuto
                                                     start=1):
                 tasks.append(
                     asyncio.create_task(call_stub(stub, trigger_request)))
-                
+            f = open('worker_trace.log', 'a')    
             results = await self.comm_handler.output_queue[virtual_engine].get()
 
+            cur = time.time()
+            for seq_group_metadata in execute_model_req.seq_group_metadata_list:
+                cur_request_id = seq_group_metadata.request_id
+                print(f'request {cur_request_id} returns to head server at {cur}', file = f)
+            print(f'{virtual_engine} back to head at {time.time()}', file = f)
+            f.close()
             return results
         
         except Exception as e:
@@ -434,9 +444,34 @@ class MolinkMultiprocessingDistributedExecutor(MultiprocessingDistributedExecuto
     ):
         try:
             virtual_engine = execute_model_req.virtual_engine
+            f = open('worker_trace.log', 'a')
+            batch = execute_model_req.virtual_engine
+            batch_size = len(execute_model_req.seq_group_metadata_list)
 
+            is_prefill = execute_model_req.seq_group_metadata_list[0].is_prompt
+
+            cur_stage = ''
+            if is_prefill:
+                cur_stage = 'prefill'
+            else:
+                cur_stage = 'decode'
+                
             async with self.pp_lock:
+                print(f'{batch} {batch_size} compute starts ({cur_stage}) at {time.time()}', file = f)
+
+                cur = time.time()
+                for seq_group_metadata in execute_model_req.seq_group_metadata_list:
+                    cur_request_id = seq_group_metadata.request_id
+                    print(f'request {cur_request_id} starts to compute ({cur_stage}) on worker at {cur}', file = f)
                 outputs = await self.driver_exec_model(execute_model_req)
+                torch.cuda.synchronize()
+                cur = time.time()
+                for seq_group_metadata in execute_model_req.seq_group_metadata_list:
+                    cur_request_id = seq_group_metadata.request_id
+                    print(f'request {cur_request_id} finishes computing ({cur_stage}) on worker at {cur}', file = f)
+                print(f'{batch} {batch_size} compute ends ({cur_stage}) at {time.time()}', file = f)
+
+            f.close()
             
             if not P.IN_AUTODL:
                 server_list = grpc_metadata.get('server_list', []) if grpc_metadata else []
