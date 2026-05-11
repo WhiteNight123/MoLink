@@ -91,4 +91,5 @@ class MolinkEngine(AsyncLLM):
             molink_start_layer=engine_args.molink_start_layer,
             molink_end_layer=engine_args.molink_end_layer,
             molink_enable_metrics=getattr(engine_args, "molink_enable_metrics", False),
+            molink_max_concurrent_batches=getattr(engine_args, "molink_max_concurrent_batches", 2),
         )
