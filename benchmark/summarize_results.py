@@ -45,9 +45,12 @@ matplotlib.rcParams.update({
 })
 
 NET_DISPLAY = {
-    "bw1gbit_delay10ms": "1 Gbps\n10 ms",
-    "bw1gbit_delay20ms": "1 Gbps\n20 ms",
-    "bw5gbit_delay10ms": "5 Gbps\n10 ms",
+    "no_limit": "No Limit",
+    "bw500mbit_delay10ms": "500M-10ms",
+    "bw1gbit_delay10ms": "1G-10ms",
+    "bw1gbit_delay20ms": "1G-20ms",
+    "bw1gbit_delay30ms": "1G-30ms",
+    "bw5gbit_delay10ms": "5G-10ms",
 }
 
 SYSTEM_STYLE = {
@@ -207,6 +210,7 @@ def plot_rps_comparison(data: dict, output_dir: Path, net: str = "bw1gbit_delay1
         ax.set_ylabel(ylabel)
         ax.set_title(f"{slbl} {title}")
         ax.set_xticks(rps_list)
+        ax.tick_params(axis="x", rotation=30)
         _add_ygrid(ax)
 
     fig.tight_layout(rect=[0, 0.15, 1, 1])
@@ -263,6 +267,7 @@ def plot_network_comparison(data: dict, output_dir: Path, rps: float = 5) -> Pat
             ax.bar_label(bars, labels=bar_labels, fontsize=7.5, padding=2)
         ax.set_xticks(x)
         ax.set_xticklabels(net_labels)
+        ax.tick_params(axis="x", rotation=30)
         ax.set_ylabel(ylabel)
         ax.set_title(f"{slbl} {title}")
         _add_ygrid(ax)

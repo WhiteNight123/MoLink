@@ -48,10 +48,11 @@ RAY_PORT=6379
 
 # Network conditions to test: "bandwidth,latency"
 NETWORK_CONDITIONS=(
-    "500mbit,10ms"
+    "none"
     "1gbit,10ms"
     "5gbit,10ms"
     "1gbit,20ms"
+    "500mbit,10ms"
     "1gbit,30ms"
 )
 
@@ -74,7 +75,7 @@ RESULTS_DIR="${RESULTS_ROOT}/${TIMESTAMP}"
 BENCHMARK_CLIENT="/home/emnets-2/gxq/molink-measurement/MoLink/benchmark/benchmark_client.py"
 
 # Health check
-HEALTH_TIMEOUT=600     # seconds to wait for service startup
+HEALTH_TIMEOUT=300     # seconds to wait for service startup
 
 # =========================== LOGGING ========================================
 
@@ -126,6 +127,7 @@ start_containers() {
         sleep infinity
 
     log "Containers started ($C1_NAME=$C1_IP  $C2_NAME=$C2_IP)"
+    sleep 5
 }
 
 # =========================== NETWORK SHAPING ================================
@@ -155,6 +157,13 @@ setup_network() {
             match ip dst ${C1_IP} flowid 1:1"
 
     log "Network shaping applied."
+}
+
+reset_network() {
+    log "Removing network shaping (no limit)..."
+    docker exec "$C1_NAME" bash -c "tc qdisc del dev eth0 root 2>/dev/null || true"
+    docker exec "$C2_NAME" bash -c "tc qdisc del dev eth0 root 2>/dev/null || true"
+    log "Network shaping removed."
 }
 
 # =========================== SERVICE MANAGEMENT =============================
@@ -204,13 +213,13 @@ start_molink() {
             --max-model-len ${MAX_MODEL_LEN} \
             --molink-max-concurrent-batches ${MAX_CONCURRENT_BATCHES} \
             --enforce-eager \
-            --no-enable-prefix-caching \
+            # --no-enable-prefix-caching \
             &>/tmp/bench_head.log"
 
     # Wait for head to fully start (model loading + gRPC ready)
     wait_for_health "http://localhost:${HEAD_HOST_PORT}/health" 300
     log "Head node is ready. Waiting extra 10s for gRPC stabilization..."
-    sleep 10
+    sleep 20
 
     log "Starting MoLink tail node (layers 21-end)..."
     docker exec -d -e PYTHONPATH="${MOLINK_CODE}" -e VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=3600 "$C2_NAME" bash -c "\
@@ -224,7 +233,7 @@ start_molink() {
             --molink-max-concurrent-batches ${MAX_CONCURRENT_BATCHES} \
             --molink-initial-peer ${C1_IP}:${MOLINK_GRPC_HEAD} \
             --enforce-eager \
-            --no-enable-prefix-caching \
+            # --no-enable-prefix-caching \
             &>/tmp/bench_tail.log"
 
     # Wait for tail to be ready too
@@ -363,11 +372,19 @@ EOF
         for net_cond in "${NETWORK_CONDITIONS[@]}"; do
             bw="${net_cond%%,*}"
             delay="${net_cond##*,}"
-            net_label="bw${bw}_delay${delay}"
+            if [ "$net_cond" = "none" ]; then
+                net_label="no_limit"
+            else
+                net_label="bw${bw}_delay${delay}"
+            fi
 
             log "=========== ${system} | ${net_label} ==========="
 
-            setup_network "$bw" "$delay"
+            if [ "$net_cond" = "none" ]; then
+                reset_network
+            else
+                setup_network "$bw" "$delay"
+            fi
             stop_services
 
             if [ "$system" = "molink" ]; then

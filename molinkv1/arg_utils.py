@@ -48,8 +48,8 @@ class MolinkEngineArgs(AsyncEngineArgs):
         parser.add_argument(
             "--molink-max-concurrent-batches",
             type=int,
-            default=2,
-            help="Maximum number of concurrent batches in MoLink pipeline (default: 2).",
+            default=1,
+            help="Maximum number of concurrent batches in MoLink pipeline (default: 1).",
         )
         return parser
 

@@ -18,7 +18,7 @@ class MolinkEngine(AsyncLLM):
         molink_start_layer = kwargs.pop("molink_start_layer", 0)
         molink_end_layer = kwargs.pop("molink_end_layer", -1)
         molink_enable_metrics = kwargs.pop("molink_enable_metrics", False)
-        molink_max_concurrent_batches = kwargs.pop("molink_max_concurrent_batches", 2)
+        molink_max_concurrent_batches = kwargs.pop("molink_max_concurrent_batches", 1)
 
         config = kwargs.get("vllm_config")
         config.__class__ = VllmConfig1
@@ -36,6 +36,16 @@ class MolinkEngine(AsyncLLM):
         # Async scheduling stores sampled tokens on GPU and communicates
         # them via NCCL PP broadcast, which doesn't work with gRPC.
         config.scheduler_config.async_scheduling = False
+
+        # Chunked prefill causes tensor size mismatches between the
+        # scheduler output and the intermediate tensors produced by
+        # the head node's model runner.
+        config.scheduler_config.enable_chunked_prefill = False
+
+        # Cross-node PP stores intermediate tensors in a FIFO deque on the
+        # worker. Batches are processed in order (execute_model enqueues,
+        # sample_tokens dequeues), so concurrent batches do not interfere.
+        molink_config.max_concurrent_batches = 1
 
         config.parallel_config.worker_cls = "molinkv1.worker.MolinkWorker"
 
@@ -91,5 +101,5 @@ class MolinkEngine(AsyncLLM):
             molink_start_layer=engine_args.molink_start_layer,
             molink_end_layer=engine_args.molink_end_layer,
             molink_enable_metrics=getattr(engine_args, "molink_enable_metrics", False),
-            molink_max_concurrent_batches=getattr(engine_args, "molink_max_concurrent_batches", 2),
+            molink_max_concurrent_batches=getattr(engine_args, "molink_max_concurrent_batches", 1),
         )

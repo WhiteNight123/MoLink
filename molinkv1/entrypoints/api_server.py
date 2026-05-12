@@ -217,7 +217,7 @@ async def init_app(
             start_layer=engine_args.molink_start_layer,
             end_layer=engine_args.molink_end_layer,
             enable_metrics=getattr(engine_args, "molink_enable_metrics", False),
-            max_concurrent_batches=getattr(engine_args, "molink_max_concurrent_batches", 2),
+            max_concurrent_batches=getattr(engine_args, "molink_max_concurrent_batches", 1),
         )
         from molinkv1.config import VllmConfig1
         vllm_config.__class__ = VllmConfig1
@@ -227,6 +227,10 @@ async def init_app(
         # Async scheduling stores sampled tokens on GPU and communicates
         # them via NCCL PP broadcast, which doesn't work with gRPC.
         vllm_config.scheduler_config.async_scheduling = False
+
+        # Chunked prefill causes tensor size mismatches between the
+        # scheduler output and the intermediate tensors.
+        vllm_config.scheduler_config.enable_chunked_prefill = False
 
         engine = MolinkWorkerNode(vllm_config)
     elif has_layer_split:

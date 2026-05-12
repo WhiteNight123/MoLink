@@ -1,5 +1,6 @@
 """A GPU worker class for MoLink cross-node pipeline parallelism."""
 
+from collections import deque
 from types import NoneType
 from typing import TYPE_CHECKING, Optional
 
@@ -34,18 +35,19 @@ class MolinkWorker(Worker):
             distributed_init_method=distributed_init_method,
             is_driver_worker=is_driver_worker,
         )
-        self._molink_intermediate_tensors: Optional[IntermediateTensors] = None
+        self._molink_intermediate_tensors: deque[IntermediateTensors] = deque()
 
     def _molink_set_intermediate_tensors(
         self, intermediate_tensors: IntermediateTensors
     ) -> None:
-        self._molink_intermediate_tensors = intermediate_tensors
+        self._molink_intermediate_tensors.append(intermediate_tensors)
 
     def _molink_get_intermediate_tensors(self) -> Optional[IntermediateTensors]:
-        """Return stored intermediate tensors (kept on current device)."""
-        tensors = self._molink_intermediate_tensors
-        self._molink_intermediate_tensors = None
-        return tensors
+        """Return oldest stored intermediate tensors, or None if empty."""
+        try:
+            return self._molink_intermediate_tensors.popleft()
+        except IndexError:
+            return None
 
     def init_device(self):
         import vllm.v1.worker.gpu_worker as gpu_worker_module
@@ -115,7 +117,7 @@ class MolinkWorker(Worker):
 
         if is_molink:
             if not get_pp_group().is_last_rank:
-                self._molink_intermediate_tensors = output
+                self._molink_set_intermediate_tensors(output)
             return None
         else:
             assert not get_pp_group().is_last_rank

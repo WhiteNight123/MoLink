@@ -377,10 +377,11 @@ class MolinkExecutor(MultiprocExecutor):
                     None, future.result
                 )
 
+            virtual_engine = getattr(scheduler_output, "virtual_engine", 0)
+
             # 2. Get pipeline metadata
             grpc_metadata = self.molink_service.topology.get_metadata()
             server_list = grpc_metadata.get("server_list", [])
-            virtual_engine = getattr(scheduler_output, "virtual_engine", 0)
 
             if len(server_list) < 2:
                 logger.error(

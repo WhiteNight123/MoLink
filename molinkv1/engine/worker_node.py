@@ -254,7 +254,6 @@ class WorkerNodeService(molink_pb2_grpc.MolinkServiceServicer):
     async def _run_step(self, scheduler_output, intermediate_tensors):
         """Run execute_model + sample_tokens on the local worker."""
         loop = asyncio.get_running_loop()
-
         # Set intermediate tensors.
         self.worker._molink_set_intermediate_tensors(intermediate_tensors)
 
