@@ -228,10 +228,6 @@ async def init_app(
         # them via NCCL PP broadcast, which doesn't work with gRPC.
         vllm_config.scheduler_config.async_scheduling = False
 
-        # Chunked prefill causes tensor size mismatches between the
-        # scheduler output and the intermediate tensors.
-        vllm_config.scheduler_config.enable_chunked_prefill = False
-
         engine = MolinkWorkerNode(vllm_config)
     elif has_layer_split:
         engine = MolinkEngine.from_engine_args(

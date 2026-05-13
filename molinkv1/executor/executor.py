@@ -48,27 +48,46 @@ logger = init_logger(__name__)
 
 
 def _serialize_tensors(tensors_cpu: Dict[str, torch.Tensor]) -> molink_pb2.IntermediateTensors:
-    """Serialize a dict of CPU tensors into a protobuf IntermediateTensors message."""
+    """Serialize a dict of CPU tensors into a protobuf IntermediateTensors message.
+
+    Uses a flat binary layout per tensor to minimize Python overhead:
+    [ndim(4B)][shape(ndim*8B)][dtype_len(4B)][dtype][raw_data]
+    """
     grpc_tensors = molink_pb2.IntermediateTensors()
     for key, tensor in tensors_cpu.items():
-        tensor = tensor.detach().cpu()
         shape = tensor.shape
-        torch_dtype = str(tensor.dtype)
+        ndim = len(shape)
+        dtype_str = str(tensor.dtype)
+        dtype_bytes = dtype_str.encode("ascii")
+
         if tensor.dtype == torch.bfloat16:
             t_bf = tensor.contiguous()
             if t_bf.dim() == 0:
-                raw = t_bf.unsqueeze(0).view(dtype=torch.uint8).numpy().tobytes()
+                raw = t_bf.unsqueeze(0).view(torch.uint8).numpy().tobytes()
             else:
-                raw = t_bf.view(dtype=torch.uint8).numpy().tobytes()
+                raw = t_bf.view(torch.uint8).numpy().tobytes()
         else:
             raw = tensor.numpy().tobytes()
-        header = struct.pack("<I", len(shape))
+
+        # Pre-compute header size and use single allocation
+        header_size = 4 + ndim * 8 + 4 + len(dtype_bytes)
+        buf = bytearray(header_size + len(raw))
+        off = 0
+
+        # Shape
+        struct.pack_into("<I", buf, off, ndim); off += 4
         for dim in shape:
-            header += struct.pack("<Q", dim)
-        dtype_bytes = torch_dtype.encode("ascii")
-        header += struct.pack("<I", len(dtype_bytes)) + dtype_bytes
+            struct.pack_into("<Q", buf, off, dim); off += 8
+
+        # Dtype
+        struct.pack_into("<I", buf, off, len(dtype_bytes)); off += 4
+        buf[off:off + len(dtype_bytes)] = dtype_bytes; off += len(dtype_bytes)
+
+        # Raw data
+        buf[off:off + len(raw)] = raw
+
         grpc_tensors.tensors.append(
-            molink_pb2.TensorEntry(key=key, tensor_data=header + raw)
+            molink_pb2.TensorEntry(key=key, tensor_data=bytes(buf))
         )
     return grpc_tensors
 
@@ -80,7 +99,12 @@ class MolinkExecutor(MultiprocExecutor):
 
     @property
     def max_concurrent_batches(self) -> int:
-        return self.molink_config.max_concurrent_batches
+        config = self.molink_config
+        result = config.max_concurrent_batches if config is not None else 1
+        if (config is not None and config.is_head_node
+                and config.get_serving_layers()[1] != -1):
+            result = max(2, result)
+        return result
 
     def __init__(self, vllm_config: VllmConfig, monitor_workers: bool = True):
         self.molink_config: "MolinkConfig" = getattr(
@@ -121,6 +145,11 @@ class MolinkExecutor(MultiprocExecutor):
 
         # Queue to pass scheduler_output from execute_model to sample_tokens.
         self._scheduler_output_queue: deque = deque()
+
+        # Queue for pre-retrieved intermediate tensors (retrieved in
+        # execute_model, consumed by _do_pipeline).  This avoids RPC races
+        # between the engine thread and async pipeline coroutines.
+        self._intermediate_tensors_queue: deque = deque()
 
         # Initialize parent executor
         super().__init__(vllm_config, monitor_workers=monitor_workers)
@@ -276,7 +305,7 @@ class MolinkExecutor(MultiprocExecutor):
         next_server: str,
     ) -> None:
         """Send intermediate tensors to the next pipeline stage via gRPC."""
-        tensors_cpu = {k: v.to("cpu") for k, v in tensors.items()}
+        tensors_cpu = {k: v.detach().cpu() for k, v in tensors.items()}
         grpc_tensors = _serialize_tensors(tensors_cpu)
 
         request = molink_pb2.GrpcRequestData(
@@ -317,20 +346,37 @@ class MolinkExecutor(MultiprocExecutor):
     ) -> ModelRunnerOutput | None | Future[ModelRunnerOutput | None]:
         """Execute the model on local workers.
 
-        For the head node in multi-node mode, we store scheduler_output so
-        sample_tokens can send intermediate tensors to the next node.
+        For the head node, runs head compute synchronously (even when
+        non_block=True) so intermediate tensors are stored before
+        sample_tokens runs the cross-node pipeline.  The result (None)
+        is wrapped in a resolved Future when non_block=True.
         """
         if self.molink_config.is_head_node and not self._is_molink_last_stage():
             if scheduler_output.total_num_scheduled_tokens > 0:
                 self._scheduler_output_queue.append(scheduler_output)
                 t_start = time.perf_counter()
-                result = super().execute_model(scheduler_output, non_block)
+                # Always run head compute synchronously so intermediate
+                # tensors are ready before sample_tokens.
+                result = super().execute_model(scheduler_output, non_block=False)
+                # Retrieve intermediate tensors immediately in the engine
+                # thread to avoid RPC races with _do_pipeline coroutines.
+                tensors_result = MultiprocExecutor.collective_rpc(
+                    self, "_molink_get_intermediate_tensors")
+                intermediate = (tensors_result[0] if isinstance(tensors_result, list)
+                               else tensors_result)
+                self._intermediate_tensors_queue.append(intermediate)
                 self.molink_service._record_metric({
                     "type": "head_compute",
                     "compute_ms": (time.perf_counter() - t_start) * 1000,
                     "num_tokens": scheduler_output.total_num_scheduled_tokens,
                     "timestamp": time.time(),
                 })
+                # When engine core requested non_block, wrap the result
+                # in an already-resolved Future.
+                if non_block:
+                    f: Future = Future()
+                    f.set_result(result)
+                    return f
                 return result
 
         return super().execute_model(scheduler_output, non_block)
@@ -353,16 +399,9 @@ class MolinkExecutor(MultiprocExecutor):
             t_total_start = time.perf_counter()
             scheduler_output = self._scheduler_output_queue.popleft()
 
-            # 1. Get intermediate tensors from local workers.
-            results = await asyncio.get_running_loop().run_in_executor(
-                None,
-                lambda: MultiprocExecutor.collective_rpc(
-                    self, "_molink_get_intermediate_tensors"
-                ),
-            )
-            intermediate_tensors = (
-                results[0] if isinstance(results, list) else results
-            )
+            # 1. Get pre-retrieved intermediate tensors (already fetched
+            #    by execute_model in the engine thread, no RPC needed).
+            intermediate_tensors = self._intermediate_tensors_queue.popleft()
 
             if intermediate_tensors is None:
                 logger.error(
@@ -397,7 +436,8 @@ class MolinkExecutor(MultiprocExecutor):
 
             # 3. Serialize scheduler_output
             t_ser_start = time.perf_counter()
-            scheduler_output_bytes = cloudpickle.dumps(
+            # Use stdlib pickle (faster than cloudpickle for vLLM objects).
+            scheduler_output_bytes = pickle.dumps(
                 scheduler_output, protocol=pickle.HIGHEST_PROTOCOL
             )
             t_ser_end = time.perf_counter()
@@ -424,7 +464,7 @@ class MolinkExecutor(MultiprocExecutor):
             t_wait_end = time.perf_counter()
 
             t_deser_start = time.perf_counter()
-            result = cloudpickle.loads(output_bytes)
+            result = pickle.loads(output_bytes)
             t_deser_end = time.perf_counter()
 
             self.molink_service._record_metric({

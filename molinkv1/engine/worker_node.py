@@ -51,31 +51,41 @@ logger = init_logger(__name__)
 # ---------------------------------------------------------------------------
 
 def _serialize_tensors(tensors_cpu: dict[str, torch.Tensor]) -> molink_pb2.IntermediateTensors:
+    """Serialize tensors using a flat binary layout with pre-sized buffers."""
     grpc_tensors = molink_pb2.IntermediateTensors()
     for key, tensor in tensors_cpu.items():
-        tensor = tensor.detach().cpu()
         shape = tensor.shape
-        torch_dtype = str(tensor.dtype)
+        ndim = len(shape)
+        dtype_str = str(tensor.dtype)
+        dtype_bytes = dtype_str.encode("ascii")
+
         if tensor.dtype == torch.bfloat16:
             t_bf = tensor.contiguous()
             if t_bf.dim() == 0:
-                raw = t_bf.unsqueeze(0).view(dtype=torch.uint8).numpy().tobytes()
+                raw = t_bf.unsqueeze(0).view(torch.uint8).numpy().tobytes()
             else:
-                raw = t_bf.view(dtype=torch.uint8).numpy().tobytes()
+                raw = t_bf.view(torch.uint8).numpy().tobytes()
         else:
             raw = tensor.numpy().tobytes()
-        header = struct.pack("<I", len(shape))
+
+        header_size = 4 + ndim * 8 + 4 + len(dtype_bytes)
+        buf = bytearray(header_size + len(raw))
+        off = 0
+        struct.pack_into("<I", buf, off, ndim); off += 4
         for dim in shape:
-            header += struct.pack("<Q", dim)
-        dtype_bytes = torch_dtype.encode("ascii")
-        header += struct.pack("<I", len(dtype_bytes)) + dtype_bytes
+            struct.pack_into("<Q", buf, off, dim); off += 8
+        struct.pack_into("<I", buf, off, len(dtype_bytes)); off += 4
+        buf[off:off + len(dtype_bytes)] = dtype_bytes; off += len(dtype_bytes)
+        buf[off:off + len(raw)] = raw
+
         grpc_tensors.tensors.append(
-            molink_pb2.TensorEntry(key=key, tensor_data=header + raw)
+            molink_pb2.TensorEntry(key=key, tensor_data=bytes(buf))
         )
     return grpc_tensors
 
 
 def _deserialize_tensors(tensor_bytes: Dict[str, bytes]) -> IntermediateTensors:
+    """Deserialize tensors from the flat binary layout."""
     tensors = {}
     for key, data in tensor_bytes.items():
         offset = 0
@@ -84,7 +94,7 @@ def _deserialize_tensors(tensor_bytes: Dict[str, bytes]) -> IntermediateTensors:
         for _ in range(ndim):
             (dim,) = struct.unpack_from("<Q", data, offset); shape.append(dim); offset += 8
         (dtype_len,) = struct.unpack_from("<I", data, offset); offset += 4
-        dtype_name = data[offset : offset + dtype_len].decode("ascii"); offset += dtype_len
+        dtype_name = data[offset:offset + dtype_len].decode("ascii"); offset += dtype_len
         raw = data[offset:]
         if dtype_name == "torch.bfloat16":
             n_elements = 1
@@ -136,8 +146,9 @@ class WorkerNodeService(molink_pb2_grpc.MolinkServiceServicer):
         self._metrics_deque = collections.deque(maxlen=2000)
         self._metrics_enabled = False
 
-        # Serialize pipeline-step execution so only one _run_step runs at a time.
-        self._step_lock = asyncio.Lock()
+        # Serialize GPU compute (model runner is not concurrent-safe) but
+        # send results in background so the handler returns immediately.
+        self._compute_lock = asyncio.Lock()
 
     def _record_metric(self, metric: dict):
         if not self._metrics_enabled:
@@ -191,16 +202,16 @@ class WorkerNodeService(molink_pb2_grpc.MolinkServiceServicer):
         intermediate_tensors = await loop.run_in_executor(
             None, _deserialize_tensors, intermediate_tensors_bytes
         )
-        scheduler_output = cloudpickle.loads(scheduler_output_bytes)
+        scheduler_output = pickle.loads(scheduler_output_bytes)
         t_deser_end = time.perf_counter()
 
-        # Compute
+        # Compute (serialized — model runner is not concurrent-safe)
         t_compute_start = time.perf_counter()
-        async with self._step_lock:
+        async with self._compute_lock:
             output = await self._run_step(scheduler_output, intermediate_tensors)
         t_compute_end = time.perf_counter()
 
-        # Route the result.
+        # Route the result
         server_list = grpc_metadata.get("server_list", [])
         my_address = f"{self._ip}:{self._grpc_port}"
         try:
@@ -214,7 +225,7 @@ class WorkerNodeService(molink_pb2_grpc.MolinkServiceServicer):
         t_push_start = time.perf_counter()
         if is_last_stage:
             head_server = grpc_metadata.get("head")
-            output_bytes = cloudpickle.dumps(output, protocol=pickle.HIGHEST_PROTOCOL)
+            output_bytes = pickle.dumps(output, protocol=pickle.HIGHEST_PROTOCOL)
             await self._push_sampler_output(output_bytes, virtual_engine, head_server)
         else:
             next_server = server_list[my_idx + 1]
@@ -254,27 +265,21 @@ class WorkerNodeService(molink_pb2_grpc.MolinkServiceServicer):
     async def _run_step(self, scheduler_output, intermediate_tensors):
         """Run execute_model + sample_tokens on the local worker."""
         loop = asyncio.get_running_loop()
-        # Set intermediate tensors.
         self.worker._molink_set_intermediate_tensors(intermediate_tensors)
 
-        # Execute model forward pass.
         output = await loop.run_in_executor(
             None, self.worker.execute_model, scheduler_output
         )
 
         if output is None:
-            # Non-last PP stages store intermediate tensors internally
-            # instead of returning them. Retrieve them for forwarding.
             stored = self.worker._molink_get_intermediate_tensors()
             if stored is not None:
                 output = stored
             else:
-                # Last PP stage: run sample_tokens to produce final output.
                 output = await loop.run_in_executor(
                     None, self.worker.sample_tokens, None
                 )
 
-        # Resolve async output (contains unpicklable torch.Event/Stream).
         from vllm.v1.outputs import AsyncModelRunnerOutput
         if isinstance(output, AsyncModelRunnerOutput):
             output = await loop.run_in_executor(None, output.get_output)

@@ -22,6 +22,8 @@ import argparse
 import asyncio
 import json
 import logging
+import random
+import string
 import sys
 import time
 from dataclasses import dataclass
@@ -134,14 +136,26 @@ class RequestResult:
     generated_text: str = ""
 
 
-def generate_prompt(target_tokens: int) -> str:
+def generate_prompt(target_tokens: int, request_index: int | None = None) -> str:
     """Generate a prompt of exactly *target_tokens* tokens.
 
     Repeats diverse text blocks and truncates to the exact token count
     using the real tokenizer (or char-ratio fallback).
+
+    When *request_index* is provided, a unique random prefix is prepended
+    so every request starts with different tokens — this defeats automatic
+    prefix caching (APC) in vLLM and similar engines.
     """
+    if request_index is not None:
+        # deterministic per-request seed so token counts stay consistent
+        rng = random.Random(request_index)
+        padding = ''.join(rng.choices(string.ascii_lowercase, k=120))
+        prefix = f"<|req_{request_index}|>{padding}\n\n"
+    else:
+        prefix = ""
+
     repeats = (target_tokens * int(_FALLBACK_CHARS_PER_TOKEN) * 2) // len(_PROMPT_TEXT) + 1
-    long_text = (_PROMPT_TEXT + " ") * repeats
+    long_text = prefix + (_PROMPT_TEXT + " ") * repeats
     return truncate_to_tokens(long_text, target_tokens)
 
 
@@ -313,16 +327,24 @@ def _stats(data: list[float]) -> dict[str, float | None]:
 async def run_benchmark(
     url: str,
     endpoint_type: str,
-    prompt: str,
+    input_tokens: int,
     max_tokens: int,
     rps: float,
     duration: int,
     model: str,
+    *,
+    fixed_prompt: str | None = None,
 ) -> dict[str, Any]:
     """Launch requests at *rps* for *duration* seconds and collect metrics."""
 
     total_requests = int(rps * duration)
     interval = 1.0 / rps
+
+    # Pre-generate prompts: unique per request (defeats prefix caching) or fixed
+    if fixed_prompt is not None:
+        prompts = [fixed_prompt] * total_requests
+    else:
+        prompts = [generate_prompt(input_tokens, i) for i in range(total_requests)]
 
     connector = aiohttp.TCPConnector(limit=0, keepalive_timeout=0)
     tasks: list[asyncio.Task] = []
@@ -330,6 +352,7 @@ async def run_benchmark(
     async with aiohttp.ClientSession(connector=connector) as session:
         bench_start = time.monotonic()
         for i in range(total_requests):
+            prompt = prompts[i]
             if endpoint_type == "molink":
                 coro = _bench_molink(session, url, prompt, max_tokens)
             else:
@@ -353,7 +376,7 @@ async def run_benchmark(
         "config": {
             "url": url,
             "type": endpoint_type,
-            "input_tokens": count_tokens(prompt),
+            "input_tokens": input_tokens,
             "max_tokens": max_tokens,
             "rps": rps,
             "duration_s": duration,
@@ -403,12 +426,15 @@ def main():
     get_tokenizer(args.tokenizer or args.model)
 
     if args.prompt_file:
-        prompt = Path(args.prompt_file).read_text()
+        fixed_prompt = Path(args.prompt_file).read_text()
+        actual_input_tokens = count_tokens(fixed_prompt)
+        print(f"Prompt from file: {actual_input_tokens} tokens ({len(fixed_prompt)} chars)")
     else:
-        prompt = generate_prompt(args.input_tokens)
+        fixed_prompt = None
+        actual_input_tokens = args.input_tokens
+        sample = generate_prompt(actual_input_tokens, request_index=0)
+        print(f"Prompt: {count_tokens(sample)} tokens ({len(sample)} chars)")
 
-    actual_input_tokens = count_tokens(prompt)
-    print(f"Prompt: {actual_input_tokens} tokens ({len(prompt)} chars)")
     print(f"Config: type={args.type}  rps={args.rps}  duration={args.duration}s  "
           f"max_tokens={args.output_tokens}")
     print(f"Target: {args.url}")
@@ -416,11 +442,12 @@ def main():
     summary = asyncio.run(run_benchmark(
         url=args.url,
         endpoint_type=args.type,
-        prompt=prompt,
+        input_tokens=actual_input_tokens,
         max_tokens=args.output_tokens,
         rps=args.rps,
         duration=args.duration,
         model=args.model,
+        fixed_prompt=fixed_prompt,
     ))
 
     r = summary["results"]

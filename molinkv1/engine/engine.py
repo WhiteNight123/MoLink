@@ -37,17 +37,12 @@ class MolinkEngine(AsyncLLM):
         # them via NCCL PP broadcast, which doesn't work with gRPC.
         config.scheduler_config.async_scheduling = False
 
-        # Chunked prefill causes tensor size mismatches between the
-        # scheduler output and the intermediate tensors produced by
-        # the head node's model runner.
-        config.scheduler_config.enable_chunked_prefill = False
-
-        # Cross-node PP stores intermediate tensors in a FIFO deque on the
-        # worker. Batches are processed in order (execute_model enqueues,
-        # sample_tokens dequeues), so concurrent batches do not interfere.
-        molink_config.max_concurrent_batches = 1
-
         config.parallel_config.worker_cls = "molinkv1.worker.MolinkWorker"
+
+        # Enable pipeline parallelism via env var (survives multiprocessing
+        # spawn, unlike in-process monkey-patching).
+        import os
+        os.environ["MOLINK_ENABLE_PIPELINE"] = "1"
 
         self._replace_scheduler_config(config)
         self._patch_engine_core_and_init(*args, **kwargs)
