@@ -214,6 +214,33 @@ def _deserialize_tensors(tensor_bytes: Dict[str, bytes]) -> IntermediateTensors:
     return IntermediateTensors(tensors=tensors)
 
 
+def _deserialize_combined(data: bytes) -> tuple[bytes, Dict[str, bytes]]:
+    """Deserialize the combined flat buffer from _serialize_combined.
+
+    Returns (scheduler_pickle_bytes, {tensor_key: tensor_bytes}).
+
+    Layout:
+      [scheduler_len: 8B][scheduler_pickle]
+      [num_tensors: 4B]
+      For each tensor:
+        [key_len: 4B][key][tensor_data_len: 8B][tensor_data]
+    """
+    offset = 0
+    (scheduler_len,) = struct.unpack_from("<Q", data, offset); offset += 8
+    scheduler_bytes = data[offset:offset + scheduler_len]; offset += scheduler_len
+
+    (num_tensors,) = struct.unpack_from("<I", data, offset); offset += 4
+    tensor_bytes: Dict[str, bytes] = {}
+    for _ in range(num_tensors):
+        (key_len,) = struct.unpack_from("<I", data, offset); offset += 4
+        key = data[offset:offset + key_len].decode("ascii"); offset += key_len
+        (tensor_data_len,) = struct.unpack_from("<Q", data, offset); offset += 8
+        tensor_data = data[offset:offset + tensor_data_len]; offset += tensor_data_len
+        tensor_bytes[key] = tensor_data
+
+    return scheduler_bytes, tensor_bytes
+
+
 # ---------------------------------------------------------------------------
 # gRPC Service for the worker node
 # ---------------------------------------------------------------------------
@@ -247,6 +274,15 @@ class WorkerNodeService(molink_pb2_grpc.MolinkServiceServicer):
         # Serialize GPU compute (model runner is not concurrent-safe).
         self._compute_lock = asyncio.Lock()
 
+        # Async work queue: PushIntermediateTensors enqueues here and returns
+        # immediately so the head's gRPC call is not blocked by tail compute.
+        self._work_queue: asyncio.Queue = asyncio.Queue()
+        self._worker_task: Optional[asyncio.Task] = None
+
+        # Cached pipeline metadata (avoid per-step JSON deserialize).
+        self._cached_server_list: Optional[list] = None
+        self._cached_head_server: Optional[str] = None
+
     def _record_metric(self, metric: dict):
         if not self._metrics_enabled:
             return
@@ -260,6 +296,119 @@ class WorkerNodeService(molink_pb2_grpc.MolinkServiceServicer):
     def reset_metrics(self):
         with self._metrics_lock:
             self._metrics_deque.clear()
+
+    def start_background_worker(self):
+        """Launch the background queue processor.  Must be called from the event loop."""
+        if self._worker_task is None:
+            self._worker_task = asyncio.create_task(self._process_work_queue())
+
+    async def _process_work_queue(self):
+        """Process items from the work queue sequentially (GPU is not concurrent-safe)."""
+        while True:
+            work_item = await self._work_queue.get()
+            try:
+                await self._process_work_item(work_item)
+            except Exception as e:
+                logger.error(
+                    "[MoLink][TAIL] Background worker failed for VE %s: %s",
+                    work_item.get("virtual_engine", "?"), e,
+                )
+                traceback.print_exc()
+
+    async def _process_work_item(self, work_item: dict):
+        """Execute the full tail pipeline for one micro-batch (deser → compute → push result)."""
+        t_total_start = time.perf_counter()
+        virtual_engine = work_item["virtual_engine"]
+        loop = asyncio.get_running_loop()
+        recv_bytes = 0
+
+        # Deserialize (CPU-bound → thread pool)
+        t_deser_start = time.perf_counter()
+        if "combined_data" in work_item:
+            # New combined format
+            def _deser_combined():
+                sched_bytes, tensor_bytes = _deserialize_combined(work_item["combined_data"])
+                return _deserialize_tensors(tensor_bytes), pickle.loads(sched_bytes), sum(len(v) for v in tensor_bytes.values())
+
+            intermediate_tensors, scheduler_output, recv_bytes = await loop.run_in_executor(
+                None,
+                _deser_combined,
+            )
+        else:
+            # Legacy format
+            intermediate_tensors_bytes = work_item["intermediate_tensors_bytes"]
+            scheduler_output_bytes = work_item["scheduler_output_bytes"]
+            recv_bytes = sum(len(v) for v in intermediate_tensors_bytes.values())
+
+            intermediate_tensors, scheduler_output = await loop.run_in_executor(
+                None,
+                lambda: (
+                    _deserialize_tensors(intermediate_tensors_bytes),
+                    pickle.loads(scheduler_output_bytes),
+                ),
+            )
+        t_deser_end = time.perf_counter()
+
+        # Compute (serialized — model runner is not concurrent-safe)
+        t_compute_start = time.perf_counter()
+        try:
+            async with self._compute_lock:
+                output = await self._run_step(scheduler_output, intermediate_tensors)
+        except Exception as e:
+            logger.warning(
+                "[MoLink][TAIL] _run_step failed (VE %s): %s. "
+                "Synthesizing recovery output.",
+                virtual_engine, e,
+            )
+            output = await asyncio.get_running_loop().run_in_executor(
+                None,
+                _synthesize_recovery_output,
+                scheduler_output,
+            )
+            if output is None:
+                raise
+        t_compute_end = time.perf_counter()
+
+        # Route the result (uses cached topology — same for every step)
+        server_list = self._cached_server_list
+        my_address = f"{self._ip}:{self._grpc_port}"
+        try:
+            my_idx = server_list.index(my_address)
+        except ValueError:
+            my_idx = len(server_list) - 1
+
+        is_last_stage = (my_idx == len(server_list) - 1)
+
+        # Push result
+        t_push_start = time.perf_counter()
+        if is_last_stage:
+            output_bytes = await loop.run_in_executor(
+                None,
+                pickle.dumps,
+                output,
+                pickle.HIGHEST_PROTOCOL,
+            )
+            await self._push_sampler_output(output_bytes, virtual_engine, self._cached_head_server)
+        else:
+            next_server = server_list[my_idx + 1]
+            tensors = output.tensors if isinstance(output, IntermediateTensors) else {"hidden_states": output}
+            cached_meta = {"head": self._cached_head_server, "server_list": self._cached_server_list}
+            await self._push_intermediate_tensors(
+                tensors, scheduler_output_bytes, cached_meta, virtual_engine, next_server
+            )
+        t_push_end = time.perf_counter()
+
+        self._record_metric({
+            "type": "worker_step",
+            "deserialize_ms": (t_deser_end - t_deser_start) * 1000,
+            "compute_ms": (t_compute_end - t_compute_start) * 1000,
+            "push_ms": (t_push_end - t_push_start) * 1000,
+            "total_ms": (time.perf_counter() - t_total_start) * 1000,
+            "is_last_stage": is_last_stage,
+            "recv_bytes": recv_bytes,
+            "virtual_engine": virtual_engine,
+            "timestamp": time.time(),
+        })
 
     def _get_stub(self, address: str) -> molink_pb2_grpc.MolinkServiceStub:
         if address not in self._stub_cache:
@@ -283,93 +432,32 @@ class WorkerNodeService(molink_pb2_grpc.MolinkServiceServicer):
     # -- data handlers ------------------------------------------------------
 
     async def PushIntermediateTensors(self, request, context):
-        t_total_start = time.perf_counter()
-        virtual_engine = request.virtual_engine
-        intermediate_tensors_bytes = {}
-        recv_bytes = 0
-        for entry in request.intermediate_tensors.tensors:
-            intermediate_tensors_bytes[entry.key] = entry.tensor_data
-            recv_bytes += len(entry.tensor_data)
-        grpc_metadata = deserialize_metadata(request.grpc_metadata)
-        scheduler_output_bytes = request.scheduler_output
+        """Enqueue work and return immediately so the head is not blocked by tail compute."""
+        # Cache pipeline metadata on first call (same for every step).
+        if self._cached_server_list is None:
+            grpc_metadata = deserialize_metadata(request.grpc_metadata)
+            self._cached_server_list = grpc_metadata.get("server_list", [])
+            self._cached_head_server = grpc_metadata.get("head")
 
-        # Deserialize (all CPU-bound work in thread pool to keep event loop free)
-        t_deser_start = time.perf_counter()
-        loop = asyncio.get_running_loop()
-
-        async def _deser_all():
-            return await loop.run_in_executor(
-                None,
-                lambda: (
-                    _deserialize_tensors(intermediate_tensors_bytes),
-                    pickle.loads(scheduler_output_bytes),
-                ),
-            )
-
-        intermediate_tensors, scheduler_output = await _deser_all()
-        t_deser_end = time.perf_counter()
-
-        # Compute (serialized — model runner is not concurrent-safe)
-        t_compute_start = time.perf_counter()
-        try:
-            async with self._compute_lock:
-                output = await self._run_step(scheduler_output, intermediate_tensors)
-        except Exception as e:
-            logger.warning(
-                "[MoLink][TAIL] _run_step failed (VE %s): %s. "
-                "Synthesizing recovery output.",
-                virtual_engine, e,
-            )
-            output = await asyncio.get_running_loop().run_in_executor(
-                None,
-                _synthesize_recovery_output,
-                scheduler_output,
-            )
-            if output is None:
-                raise
-        t_compute_end = time.perf_counter()
-
-        # Route the result
-        server_list = grpc_metadata.get("server_list", [])
-        my_address = f"{self._ip}:{self._grpc_port}"
-        try:
-            my_idx = server_list.index(my_address)
-        except ValueError:
-            my_idx = len(server_list) - 1
-
-        is_last_stage = (my_idx == len(server_list) - 1)
-
-        # Push result
-        t_push_start = time.perf_counter()
-        if is_last_stage:
-            head_server = grpc_metadata.get("head")
-            output_bytes = await loop.run_in_executor(
-                None,
-                pickle.dumps,
-                output,
-                pickle.HIGHEST_PROTOCOL,
-            )
-            await self._push_sampler_output(output_bytes, virtual_engine, head_server)
+        # Parse from combined format (scheduler_output contains everything)
+        # or legacy format (intermediate_tensors has per-tensor entries).
+        if len(request.intermediate_tensors.tensors) == 0:
+            # New combined format — parse lazily in background worker
+            work_item = {
+                "virtual_engine": request.virtual_engine,
+                "combined_data": request.scheduler_output,
+            }
         else:
-            next_server = server_list[my_idx + 1]
-            tensors = output.tensors if isinstance(output, IntermediateTensors) else {"hidden_states": output}
-            await self._push_intermediate_tensors(
-                tensors, scheduler_output_bytes, grpc_metadata, virtual_engine, next_server
-            )
-        t_push_end = time.perf_counter()
-
-        self._record_metric({
-            "type": "worker_step",
-            "deserialize_ms": (t_deser_end - t_deser_start) * 1000,
-            "compute_ms": (t_compute_end - t_compute_start) * 1000,
-            "push_ms": (t_push_end - t_push_start) * 1000,
-            "total_ms": (time.perf_counter() - t_total_start) * 1000,
-            "is_last_stage": is_last_stage,
-            "recv_bytes": recv_bytes,
-            "virtual_engine": virtual_engine,
-            "timestamp": time.time(),
-        })
-
+            # Legacy format
+            intermediate_tensors_bytes = {}
+            for entry in request.intermediate_tensors.tensors:
+                intermediate_tensors_bytes[entry.key] = entry.tensor_data
+            work_item = {
+                "virtual_engine": request.virtual_engine,
+                "intermediate_tensors_bytes": intermediate_tensors_bytes,
+                "scheduler_output_bytes": request.scheduler_output,
+            }
+        await self._work_queue.put(work_item)
         return molink_pb2.GrpcResponseData(res=1)
 
     async def PushSamplerOutput(self, request, context):
@@ -632,6 +720,7 @@ class MolinkWorkerNode:
         service._ip = self.ip
         service._grpc_port = self.grpc_port
         service._metrics_enabled = config.enable_metrics
+        service.start_background_worker()
         self.service = service
 
         molink_pb2_grpc.add_MolinkServiceServicer_to_server(service, self.grpc_server)

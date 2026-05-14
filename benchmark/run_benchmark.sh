@@ -48,25 +48,28 @@ RAY_PORT=6379
 
 # Network conditions to test: "bandwidth,latency"
 NETWORK_CONDITIONS=(
-    "none"
+    # "none"
     "1gbit,10ms"
-    "5gbit,10ms"
-    "1gbit,20ms"
-    "500mbit,10ms"
-    "1gbit,30ms"
+    # "5gbit,10ms"
+    # "1gbit,20ms"
+    # "500mbit,10ms"
+    # "1gbit,30ms"
 )
 
 # Trace parameters
 INPUT_TOKENS=1024
 OUTPUT_TOKENS=512
-RPS_VALUES=(0.5 1 3 5 7)
+RPS_VALUES=(3)
 DURATION=40            # seconds per benchmark run
 COOLDOWN=10            # seconds to wait between runs
 
 MAX_MODEL_LEN=4096
 
 # MoLink pipeline config
-MAX_CONCURRENT_BATCHES=${MOLINK_MAX_CONCURRENT_BATCHES:-1}
+MAX_CONCURRENT_BATCHES=${MOLINK_MAX_CONCURRENT_BATCHES:-2}
+# Transport: "grpc" (default, MoLink's own gRPC pipeline) or "nccl"
+# (vLLM-native NCCL PP via Ray, with MoLink layer-range patches).
+MOLINK_TRANSPORT=${MOLINK_TRANSPORT:-grpc}
 
 # Results
 RESULTS_ROOT="/home/emnets-2/gxq/molink-measurement/MoLink/benchmark/results"
@@ -181,7 +184,7 @@ wait_for_health() {
     local timeout="${2:-$HEALTH_TIMEOUT}"
     local elapsed=0
     log "Waiting for service at ${url} ..."
-    while ! curl -sf "$url" >/dev/null 2>&1; do
+    while ! curl -sf --noproxy localhost "$url" >/dev/null 2>&1; do
         sleep 5
         elapsed=$((elapsed + 5))
         if [ "$elapsed" -ge "$timeout" ]; then
@@ -202,7 +205,15 @@ wait_for_health() {
 # ---------- MoLink ----------
 
 start_molink() {
-    log "Starting MoLink head node (layers 0-20)..."
+    if [ "${MOLINK_TRANSPORT}" = "nccl" ]; then
+        start_molink_nccl
+    else
+        start_molink_grpc
+    fi
+}
+
+start_molink_grpc() {
+    log "Starting MoLink head node (layers 0-20, transport=gRPC)..."
     docker exec -d -e PYTHONPATH="${MOLINK_CODE}" -e VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=3600 "$C1_NAME" bash -c "\
         ${MOLINK_PYTHON} -m molinkv1.entrypoints.api_server \
             --model ${MODEL_PATH} \
@@ -213,15 +224,14 @@ start_molink() {
             --max-model-len ${MAX_MODEL_LEN} \
             --molink-max-concurrent-batches ${MAX_CONCURRENT_BATCHES} \
             --enforce-eager \
-            # --no-enable-prefix-caching \
+            --no-enable-prefix-caching \
             &>/tmp/bench_head.log"
 
-    # Wait for head to fully start (model loading + gRPC ready)
     wait_for_health "http://localhost:${HEAD_HOST_PORT}/health" 300
     log "Head node is ready. Waiting extra 10s for gRPC stabilization..."
     sleep 20
 
-    log "Starting MoLink tail node (layers 21-end)..."
+    log "Starting MoLink tail node (layers 21-end, transport=gRPC)..."
     docker exec -d -e PYTHONPATH="${MOLINK_CODE}" -e VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=3600 "$C2_NAME" bash -c "\
         ${MOLINK_PYTHON} -m molinkv1.entrypoints.api_server \
             --model ${MODEL_PATH} \
@@ -233,13 +243,12 @@ start_molink() {
             --molink-max-concurrent-batches ${MAX_CONCURRENT_BATCHES} \
             --molink-initial-peer ${C1_IP}:${MOLINK_GRPC_HEAD} \
             --enforce-eager \
-            # --no-enable-prefix-caching \
+            --no-enable-prefix-caching \
             &>/tmp/bench_tail.log"
 
-    # Wait for tail to be ready too
     log "Waiting for tail node health check on port ${TAIL_HOST_PORT}..."
     local elapsed=0
-    while ! curl -sf "http://localhost:${TAIL_HOST_PORT}/health" >/dev/null 2>&1; do
+    while ! curl -sf --noproxy localhost "http://localhost:${TAIL_HOST_PORT}/health" >/dev/null 2>&1; do
         sleep 5
         elapsed=$((elapsed + 5))
         if [ "$elapsed" -ge "$HEALTH_TIMEOUT" ]; then
@@ -247,9 +256,47 @@ start_molink() {
         fi
     done
     log "Tail node is ready!"
-
-    # Final wait for gRPC connection to stabilize
     sleep 5
+}
+
+start_molink_nccl() {
+    # MoLink NCCL mode: uses vLLM's native NCCL PP transport (via Ray)
+    # with MoLink custom layer-range patches applied on the head process.
+    # This replaces the gRPC transport with NCCL, achieving vLLM-level
+    # throughput while preserving MoLink's entrypoint and layer assignment.
+
+    log "Starting Ray head on ${C1_NAME} for MoLink NCCL..."
+    docker exec -d "$C1_NAME" bash -c "\
+        CUDA_VISIBLE_DEVICES=0 ${RAY_BIN} start --head \
+            --node-ip-address=${C1_IP} \
+            --port=${RAY_PORT} --num-gpus=1"
+    sleep 8
+
+    log "Starting Ray worker on ${C2_NAME} for MoLink NCCL..."
+    docker exec -d "$C2_NAME" bash -c "\
+        CUDA_VISIBLE_DEVICES=0 ${RAY_BIN} start \
+            --address=${C1_IP}:${RAY_PORT} --num-gpus=1"
+    sleep 8
+
+    log "Starting MoLink NCCL head (layers 0-21, PP=2, transport=NCCL via Ray)..."
+    docker exec -d -e PYTHONPATH="${MOLINK_CODE}" \
+        -e VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=3600 \
+        -e MOLINK_START_LAYER=0 \
+        -e MOLINK_END_LAYER=21 \
+        "$C1_NAME" bash -c "\
+        CUDA_VISIBLE_DEVICES=0 ${MOLINK_PYTHON} -m molinkv1.entrypoints.molink_nccl_server \
+            serve \
+            --model ${MODEL_PATH} \
+            --port ${HEAD_HTTP_PORT} \
+            --max-model-len ${MAX_MODEL_LEN} \
+            --pipeline-parallel-size 2 \
+            --distributed-executor-backend ray \
+            --no-enable-prefix-caching \
+            --enforce-eager \
+            &>/tmp/bench_head.log"
+
+    wait_for_health
+    log "MoLink NCCL service is ready!"
 }
 
 # ---------- vLLM + Ray ----------
@@ -300,16 +347,29 @@ run_benchmarks_for() {
         log "--- [${system}] [${net_label}] rps=${rps} ---"
 
         if [ "$system" = "molink" ]; then
-            python "$BENCHMARK_CLIENT" \
-                --url "http://localhost:${HEAD_HOST_PORT}/generate" \
-                --type molink \
-                --input-tokens "$INPUT_TOKENS" \
-                --output-tokens "$OUTPUT_TOKENS" \
-                --rps "$rps" \
-                --duration "$DURATION" \
-                --model "$MODEL_PATH" \
-                --tokenizer "$HOST_TOKENIZER_PATH" \
-                --output "${outdir}/result.json"
+            if [ "${MOLINK_TRANSPORT}" = "nccl" ]; then
+                python "$BENCHMARK_CLIENT" \
+                    --url "http://localhost:${HEAD_HOST_PORT}/v1/completions" \
+                    --type vllm \
+                    --input-tokens "$INPUT_TOKENS" \
+                    --output-tokens "$OUTPUT_TOKENS" \
+                    --rps "$rps" \
+                    --duration "$DURATION" \
+                    --model "$MODEL_PATH" \
+                    --tokenizer "$HOST_TOKENIZER_PATH" \
+                    --output "${outdir}/result.json"
+            else
+                python "$BENCHMARK_CLIENT" \
+                    --url "http://localhost:${HEAD_HOST_PORT}/generate" \
+                    --type molink \
+                    --input-tokens "$INPUT_TOKENS" \
+                    --output-tokens "$OUTPUT_TOKENS" \
+                    --rps "$rps" \
+                    --duration "$DURATION" \
+                    --model "$MODEL_PATH" \
+                    --tokenizer "$HOST_TOKENIZER_PATH" \
+                    --output "${outdir}/result.json"
+            fi
         else
             python "$BENCHMARK_CLIENT" \
                 --url "http://localhost:${HEAD_HOST_PORT}/v1/completions" \

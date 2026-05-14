@@ -92,6 +92,60 @@ def _serialize_tensors(tensors_cpu: Dict[str, torch.Tensor]) -> molink_pb2.Inter
     return grpc_tensors
 
 
+def _serialize_combined(scheduler_pickle: bytes, tensors: Dict[str, torch.Tensor]) -> bytes:
+    """Serialize scheduler output + tensors into a single flat bytes buffer.
+
+    Layout:
+      [scheduler_len: 8B][scheduler_pickle]
+      [num_tensors: 4B]
+      For each tensor:
+        [key_len: 4B][key][tensor_data_len: 8B][tensor_data]
+      where tensor_data = [ndim:4B][shape:ndim*8B][dtype_len:4B][dtype][raw]
+    """
+    buf = bytearray()
+    buf.extend(struct.pack("<Q", len(scheduler_pickle)))
+    buf.extend(scheduler_pickle)
+
+    num_tensors = len(tensors)
+    buf.extend(struct.pack("<I", num_tensors))
+
+    for key, tensor in tensors.items():
+        tensor_cpu = tensor.detach().cpu()
+        shape = tensor_cpu.shape
+        ndim = len(shape)
+        dtype_str = str(tensor_cpu.dtype)
+        dtype_bytes = dtype_str.encode("ascii")
+
+        if tensor_cpu.dtype == torch.bfloat16:
+            t_bf = tensor_cpu.contiguous()
+            if t_bf.dim() == 0:
+                raw = t_bf.unsqueeze(0).view(torch.uint8).numpy().tobytes()
+            else:
+                raw = t_bf.view(torch.uint8).numpy().tobytes()
+        else:
+            raw = tensor_cpu.numpy().tobytes()
+
+        # Build tensor_data: [ndim][shape][dtype_len][dtype][raw]
+        header_size = 4 + ndim * 8 + 4 + len(dtype_bytes)
+        tensor_data = bytearray(header_size + len(raw))
+        off = 0
+        struct.pack_into("<I", tensor_data, off, ndim); off += 4
+        for dim in shape:
+            struct.pack_into("<Q", tensor_data, off, dim); off += 8
+        struct.pack_into("<I", tensor_data, off, len(dtype_bytes)); off += 4
+        tensor_data[off:off + len(dtype_bytes)] = dtype_bytes; off += len(dtype_bytes)
+        tensor_data[off:off + len(raw)] = raw
+
+        # Entry: key_len + key + tensor_data_len + tensor_data
+        key_bytes = key.encode("ascii")
+        buf.extend(struct.pack("<I", len(key_bytes)))
+        buf.extend(key_bytes)
+        buf.extend(struct.pack("<Q", len(tensor_data)))
+        buf.extend(tensor_data)
+
+    return bytes(buf)
+
+
 class MolinkExecutor(MultiprocExecutor):
     """Executor for cross-node pipeline parallelism using gRPC."""
 
@@ -147,6 +201,10 @@ class MolinkExecutor(MultiprocExecutor):
         # (called immediately after on the same thread) can retrieve it
         # without any queue that the event loop could reorder.
         self._pending_pipeline_data: tuple | None = None
+
+        # Cached pipeline metadata (avoid per-step serialization).
+        self._molink_server_list: list | None = None
+        self._molink_grpc_metadata_bytes: bytes | None = None
 
         # Initialize parent executor
         super().__init__(vllm_config, monitor_workers=monitor_workers)
@@ -296,22 +354,28 @@ class MolinkExecutor(MultiprocExecutor):
     async def _push_intermediate_tensors(
         self,
         tensors: Dict[str, torch.Tensor],
-        scheduler_output_bytes: bytes,
-        grpc_metadata: Dict[str, Any],
+        scheduler_output: "SchedulerOutput",
+        grpc_metadata_bytes: bytes,
         virtual_engine: int,
         next_server: str,
     ) -> None:
-        """Send intermediate tensors to the next pipeline stage via gRPC."""
-        tensors_cpu = {k: v.detach().cpu() for k, v in tensors.items()}
-        grpc_tensors = _serialize_tensors(tensors_cpu)
+        """Serialize and send intermediate tensors + scheduler_output to the next stage.
 
-        request = molink_pb2.GrpcRequestData(
-            scheduler_output=scheduler_output_bytes,
-            intermediate_tensors=grpc_tensors,
-            grpc_metadata=serialize_metadata(grpc_metadata),
-            virtual_engine=virtual_engine,
-        )
+        All CPU-bound serialization (pickle + tensor copies) runs in a single
+        thread-pool call; the gRPC call is awaited to detect failures early.
+        """
+        loop = asyncio.get_running_loop()
 
+        def _prepare_request():
+            sched_bytes = pickle.dumps(scheduler_output, pickle.HIGHEST_PROTOCOL)
+            combined = _serialize_combined(sched_bytes, tensors)
+            return molink_pb2.GrpcRequestData(
+                scheduler_output=combined,
+                grpc_metadata=grpc_metadata_bytes,
+                virtual_engine=virtual_engine,
+            )
+
+        request = await loop.run_in_executor(self._executor_pool, _prepare_request)
         stub = self._get_stub(next_server)
         await stub.PushIntermediateTensors(request)
 
@@ -457,9 +521,13 @@ class MolinkExecutor(MultiprocExecutor):
 
             virtual_engine = getattr(scheduler_output, "virtual_engine", 0)
 
-            # 2. Get pipeline metadata
-            grpc_metadata = self.molink_service.topology.get_metadata()
-            server_list = grpc_metadata.get("server_list", [])
+            # 2. Get pipeline metadata (cached after first call).
+            server_list = self._molink_server_list
+            if server_list is None:
+                grpc_metadata = self.molink_service.topology.get_metadata()
+                server_list = grpc_metadata.get("server_list", [])
+                self._molink_server_list = server_list
+                self._molink_grpc_metadata_bytes = serialize_metadata(grpc_metadata)
 
             if len(server_list) < 2:
                 logger.error(
@@ -473,27 +541,15 @@ class MolinkExecutor(MultiprocExecutor):
                     None, future.result
                 )
 
-            # 3. Serialize scheduler_output in thread pool to avoid
-            #    blocking the event loop.
+            # 3. Serialize and send in one thread-pool call (pickle + tensor ser
+            #    are combined inside _push_intermediate_tensors).
             loop = asyncio.get_running_loop()
-            t_ser_start = time.perf_counter()
-            scheduler_output_bytes = await loop.run_in_executor(
-                None,
-                pickle.dumps,
-                scheduler_output,
-                pickle.HIGHEST_PROTOCOL,
-            )
-            t_ser_end = time.perf_counter()
-
-            # 4. Send intermediate tensors to next node (direct gRPC call).
-            #    The worker node executes the model directly upon receiving
-            #    the data — no separate trigger step is needed.
             next_server = server_list[1]
             t_push_start = time.perf_counter()
             await self._push_intermediate_tensors(
                 intermediate_tensors.tensors,
-                scheduler_output_bytes,
-                grpc_metadata,
+                scheduler_output,
+                self._molink_grpc_metadata_bytes,
                 virtual_engine,
                 next_server,
             )
@@ -539,7 +595,6 @@ class MolinkExecutor(MultiprocExecutor):
 
             self.molink_service._record_metric({
                 "type": "head_pipeline",
-                "serialize_scheduler_ms": (t_ser_end - t_ser_start) * 1000,
                 "push_intermediate_ms": (t_push_end - t_push_start) * 1000,
                 "wait_result_ms": (t_wait_end - t_wait_start) * 1000,
                 "deserialize_result_ms": (t_deser_end - t_deser_start) * 1000,

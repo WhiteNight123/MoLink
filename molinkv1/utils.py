@@ -58,10 +58,6 @@ def get_grpc_options(max_message_size_mb: int = 200) -> List[Tuple[str, int]]:
         List of gRPC options tuples.
     """
     max_size = max_message_size_mb * 1024 * 1024
-    # Set initial flow-control window to 16 MB to avoid slow start on
-    # large prefill tensor transfers.  The BDP of a 1 Gbps × 10 ms link
-    # is ~1.25 MB; 16 MB ensures the window never starves throughput
-    # during the first few round-trips.
     flow_control_window = 16 * 1024 * 1024
     return [
         ("grpc.max_send_message_length", max_size),
@@ -69,11 +65,7 @@ def get_grpc_options(max_message_size_mb: int = 200) -> List[Tuple[str, int]]:
         ("grpc.http2.lookahead_bytes", flow_control_window),
         ("grpc.http2.write_buffer_size", flow_control_window),
         ("grpc.http2.bdp_probe", 1),
-        ("grpc.optimization_target", "latency"),
-        # Keepalive: prevent the HTTP/2 connection from being dropped
-        # during long pipeline operations.  Server sends pings every
-        # 30 s, waits 10 s for a reply, and allows unlimited pings
-        # without a response from the peer.
+        ("grpc.optimization_target", "throughput"),
         ("grpc.keepalive_time_ms", 30000),
         ("grpc.keepalive_timeout_ms", 10000),
         ("grpc.keepalive_permit_without_calls", 1),
