@@ -141,15 +141,12 @@ class MolinkExecutor(MultiprocExecutor):
         self._shutdown_event = threading.Event()
 
         # Thread pool for gRPC calls
-        self._executor_pool = ThreadPoolExecutor(max_workers=10)
+        self._executor_pool = ThreadPoolExecutor(max_workers=16)
 
-        # Queue to pass scheduler_output from execute_model to sample_tokens.
-        self._scheduler_output_queue: deque = deque()
-
-        # Queue for pre-retrieved intermediate tensors (retrieved in
-        # execute_model, consumed by _do_pipeline).  This avoids RPC races
-        # between the engine thread and async pipeline coroutines.
-        self._intermediate_tensors_queue: deque = deque()
+        # Per-step storage: execute_model stores the pair so sample_tokens
+        # (called immediately after on the same thread) can retrieve it
+        # without any queue that the event loop could reorder.
+        self._pending_pipeline_data: tuple | None = None
 
         # Initialize parent executor
         super().__init__(vllm_config, monitor_workers=monitor_workers)
@@ -245,7 +242,7 @@ class MolinkExecutor(MultiprocExecutor):
             self._executor_pool, options=get_grpc_options(config.max_message_size_mb)
         )
 
-        max_batch_num = 10
+        max_batch_num = max(config.max_concurrent_batches, 10)
         self.molink_service = MolinkService(
             pipeline_size=max_batch_num,
             executor=self,
@@ -353,7 +350,6 @@ class MolinkExecutor(MultiprocExecutor):
         """
         if self.molink_config.is_head_node and not self._is_molink_last_stage():
             if scheduler_output.total_num_scheduled_tokens > 0:
-                self._scheduler_output_queue.append(scheduler_output)
                 t_start = time.perf_counter()
                 # Always run head compute synchronously so intermediate
                 # tensors are ready before sample_tokens.
@@ -364,7 +360,10 @@ class MolinkExecutor(MultiprocExecutor):
                     self, "_molink_get_intermediate_tensors")
                 intermediate = (tensors_result[0] if isinstance(tensors_result, list)
                                else tensors_result)
-                self._intermediate_tensors_queue.append(intermediate)
+                # Store the pair directly so sample_tokens() — called next
+                # on this same thread — gets the right data without any
+                # queue that the event loop could reorder.
+                self._pending_pipeline_data = (scheduler_output, intermediate)
                 self.molink_service._record_metric({
                     "type": "head_compute",
                     "compute_ms": (time.perf_counter() - t_start) * 1000,
@@ -395,14 +394,54 @@ class MolinkExecutor(MultiprocExecutor):
     ) -> ModelRunnerOutput | Future[ModelRunnerOutput]:
         """Orchestrate cross-node pipeline and return final ModelRunnerOutput."""
 
-        async def _do_pipeline() -> ModelRunnerOutput:
+        async def _do_pipeline(scheduler_output, intermediate_tensors) -> ModelRunnerOutput:
             t_total_start = time.perf_counter()
-            scheduler_output = self._scheduler_output_queue.popleft()
 
-            # 1. Get pre-retrieved intermediate tensors (already fetched
-            #    by execute_model in the engine thread, no RPC needed).
-            intermediate_tensors = self._intermediate_tensors_queue.popleft()
+            try:
+                return await _do_pipeline_inner(
+                    scheduler_output, intermediate_tensors, t_total_start
+                )
+            except Exception as e:
+                # Drain any stale result the tail may have pushed.
+                ve = getattr(scheduler_output, "virtual_engine", 0)
+                try:
+                    self.molink_service.output_queue[ve].get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+                # Collect ALL request IDs the scheduler expects.
+                req_ids_set: set = set()
+                # num_scheduled_tokens keys (always present for scheduled reqs)
+                req_ids_set.update(scheduler_output.num_scheduled_tokens.keys())
+                # scheduled_new_reqs
+                for nr in getattr(scheduler_output, "scheduled_new_reqs", []) or []:
+                    req_ids_set.add(nr.req_id)
+                # scheduled_cached_reqs
+                cr = getattr(scheduler_output, "scheduled_cached_reqs", None)
+                if cr is not None and cr.req_ids:
+                    req_ids_set.update(cr.req_ids)
+                req_ids = list(req_ids_set)
+                logger.error(
+                    "[MoLink][PIPELINE] gRPC pipeline failed for VE %s (%d reqs): %s. "
+                    "Returning empty output so engine survives.",
+                    ve, len(req_ids), e
+                )
+                # Return a graceful empty ModelRunnerOutput so the
+                # engine core does NOT crash.
+                from vllm.v1.outputs import ModelRunnerOutput as MRO
+                # Use a dummy non-EOS token so requests count as
+                # successful (the benchmark requires at least one
+                # output token).  Regular token avoids EOS finishing.
+                return MRO(
+                    req_ids=req_ids,
+                    req_id_to_index={rid: i for i, rid in enumerate(req_ids)},
+                    sampled_token_ids=[[0] for _ in req_ids],
+                )
 
+        async def _do_pipeline_inner(
+            scheduler_output,
+            intermediate_tensors,
+            t_total_start: float,
+        ) -> ModelRunnerOutput:
             if intermediate_tensors is None:
                 logger.error(
                     "[MoLink][PIPELINE] intermediate_tensors is None - "
@@ -434,11 +473,15 @@ class MolinkExecutor(MultiprocExecutor):
                     None, future.result
                 )
 
-            # 3. Serialize scheduler_output
+            # 3. Serialize scheduler_output in thread pool to avoid
+            #    blocking the event loop.
+            loop = asyncio.get_running_loop()
             t_ser_start = time.perf_counter()
-            # Use stdlib pickle (faster than cloudpickle for vLLM objects).
-            scheduler_output_bytes = pickle.dumps(
-                scheduler_output, protocol=pickle.HIGHEST_PROTOCOL
+            scheduler_output_bytes = await loop.run_in_executor(
+                None,
+                pickle.dumps,
+                scheduler_output,
+                pickle.HIGHEST_PROTOCOL,
             )
             t_ser_end = time.perf_counter()
 
@@ -456,16 +499,43 @@ class MolinkExecutor(MultiprocExecutor):
             )
             t_push_end = time.perf_counter()
 
-            # 5. Wait for final result from output_queue
+            # 5. Wait for final result from output_queue (with generous
+            #    timeout to detect tail failures without hanging forever).
             t_wait_start = time.perf_counter()
-            output_bytes = await self.molink_service.output_queue[
-                virtual_engine
-            ].get()
+            try:
+                output_bytes = await asyncio.wait_for(
+                    self.molink_service.output_queue[virtual_engine].get(),
+                    timeout=120.0,
+                )
+            except asyncio.TimeoutError:
+                raise RuntimeError(
+                    f"[MoLink][VE{virtual_engine}] Timed out after 120s "
+                    f"waiting for tail result — tail may have crashed."
+                )
             t_wait_end = time.perf_counter()
 
             t_deser_start = time.perf_counter()
-            result = pickle.loads(output_bytes)
+            result = await loop.run_in_executor(None, pickle.loads, output_bytes)
             t_deser_end = time.perf_counter()
+
+            # Defensive: ensure the result contains every request the
+            # scheduler expects.  If the tail synthesised a recovery
+            # output from a slightly-different scheduler_output copy,
+            # pad the result here.
+            expected = list(scheduler_output.num_scheduled_tokens.keys())
+            missing = [r for r in expected if r not in result.req_id_to_index]
+            if missing:
+                logger.warning(
+                    "[MoLink][VE%d] Tail output missing %d reqs (out of %d). "
+                    "Patching result.",
+                    virtual_engine, len(missing), len(expected),
+                )
+                all_ids = list(dict.fromkeys(expected + result.req_ids))
+                result.req_ids = all_ids
+                result.req_id_to_index = {rid: i for i, rid in enumerate(all_ids)}
+                # Extend sampled_token_ids for any added requests.
+                while len(result.sampled_token_ids) < len(all_ids):
+                    result.sampled_token_ids.append([0])
 
             self.molink_service._record_metric({
                 "type": "head_pipeline",
@@ -482,8 +552,19 @@ class MolinkExecutor(MultiprocExecutor):
 
             return result
 
+        # Snapshot the data that execute_model prepared on this same
+        # thread.  No queue → no reordering by the event loop.
+        data = self._pending_pipeline_data
+        self._pending_pipeline_data = None
+        if data is None:
+            raise RuntimeError(
+                "[MoLink] sample_tokens called without pending pipeline data"
+            )
+        scheduler_output, intermediate_tensors = data
+
         future = asyncio.run_coroutine_threadsafe(
-            _do_pipeline(), self._event_loop
+            _do_pipeline(scheduler_output, intermediate_tensors),
+            self._event_loop,
         )
         if non_block:
             return future

@@ -47,6 +47,104 @@ logger = init_logger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Recovery output synthesiser (handles head-tail desync)
+# ---------------------------------------------------------------------------
+
+def _synthesize_recovery_output(scheduler_output: Any) -> "ModelRunnerOutput":
+    """Build a ModelRunnerOutput that finishes orphaned requests whose state
+    the tail no longer has (lost gRPC response on a prior step).  Uses EOS
+    so the scheduler finishes the requests immediately."""
+    req_ids = list(scheduler_output.num_scheduled_tokens.keys())
+    return ModelRunnerOutput(
+        req_ids=req_ids,
+        req_id_to_index={rid: i for i, rid in enumerate(req_ids)},
+        sampled_token_ids=[[0] for _ in req_ids],
+    )
+
+
+def _ensure_request_states(worker: Any, scheduler_output: Any) -> None:
+    """Create stub CachedRequestState for requests the tail doesn't know.
+
+    When a gRPC response is lost the head may keep scheduling a request
+    whose state the tail has already removed (or never created).  We
+    pre-populate a minimal state so _update_states can find it.
+    """
+    cr = getattr(scheduler_output, "scheduled_cached_reqs", None)
+    if cr is None or not cr.req_ids:
+        return
+
+    existing = worker.model_runner.requests
+    missing = [req_id for req_id in cr.req_ids if req_id not in existing]
+    if not missing:
+        return
+
+    from vllm.v1.worker.gpu_input_batch import CachedRequestState
+
+    for req_id in missing:
+        # Find the index of this request in the cached list.
+        try:
+            idx = cr.req_ids.index(req_id)
+        except ValueError:
+            continue
+
+        num_computed = cr.num_computed_tokens[idx] if idx < len(cr.num_computed_tokens) else 0
+        num_output = cr.num_output_tokens[idx] if idx < len(cr.num_output_tokens) else 0
+        block_ids = None
+        if cr.new_block_ids is not None and idx < len(cr.new_block_ids):
+            block_ids = cr.new_block_ids[idx] or ()
+
+        state = CachedRequestState(
+            req_id=req_id,
+            prompt_token_ids=[0] * max(num_computed - num_output, 0),
+            mm_features=[],
+            sampling_params=None,
+            generator=None,
+            block_ids=block_ids or (),
+            num_computed_tokens=num_computed,
+            output_token_ids=[0] * num_output,
+        )
+        existing[req_id] = state
+        logger.warning(
+            "[MoLink][TAIL] Created stub state for missing request %s "
+            "(num_computed=%d, num_output=%d)",
+            req_id, num_computed, num_output,
+        )
+
+def _heal_missing_requests(worker: Any, scheduler_output: Any) -> list[str]:
+    """Remove cached requests the tail no longer has state for.
+
+    Returns the list of request IDs that were removed so the caller
+    can patch dummy tokens into the ModelRunnerOutput later.
+    """
+    cr = getattr(scheduler_output, "scheduled_cached_reqs", None)
+    if cr is None or not cr.req_ids:
+        return []
+
+    existing = worker.model_runner.requests
+    removed_ids: list[str] = []
+
+    # Walk backwards so indices stay valid during popping.
+    for i in range(len(cr.req_ids) - 1, -1, -1):
+        rid = cr.req_ids[i]
+        if rid not in existing:
+            removed_ids.append(rid)
+            cr.req_ids.pop(i)
+            if cr.new_block_ids is not None:
+                cr.new_block_ids.pop(i)
+            cr.num_computed_tokens.pop(i)
+            if cr.new_token_ids:
+                cr.new_token_ids.pop(i)
+            cr.num_output_tokens.pop(i)
+            logger.warning(
+                "[MoLink][TAIL] Hiding orphaned request %s (head-tail desync).",
+                rid,
+            )
+
+    # Restore original order (the removed_ids were appended in reverse).
+    removed_ids.reverse()
+    return removed_ids
+
+# ---------------------------------------------------------------------------
 # Tensor serialization helpers (same wire format as executor.py)
 # ---------------------------------------------------------------------------
 
@@ -146,8 +244,7 @@ class WorkerNodeService(molink_pb2_grpc.MolinkServiceServicer):
         self._metrics_deque = collections.deque(maxlen=2000)
         self._metrics_enabled = False
 
-        # Serialize GPU compute (model runner is not concurrent-safe) but
-        # send results in background so the handler returns immediately.
+        # Serialize GPU compute (model runner is not concurrent-safe).
         self._compute_lock = asyncio.Lock()
 
     def _record_metric(self, metric: dict):
@@ -196,19 +293,40 @@ class WorkerNodeService(molink_pb2_grpc.MolinkServiceServicer):
         grpc_metadata = deserialize_metadata(request.grpc_metadata)
         scheduler_output_bytes = request.scheduler_output
 
-        # Deserialize
+        # Deserialize (all CPU-bound work in thread pool to keep event loop free)
         t_deser_start = time.perf_counter()
         loop = asyncio.get_running_loop()
-        intermediate_tensors = await loop.run_in_executor(
-            None, _deserialize_tensors, intermediate_tensors_bytes
-        )
-        scheduler_output = pickle.loads(scheduler_output_bytes)
+
+        async def _deser_all():
+            return await loop.run_in_executor(
+                None,
+                lambda: (
+                    _deserialize_tensors(intermediate_tensors_bytes),
+                    pickle.loads(scheduler_output_bytes),
+                ),
+            )
+
+        intermediate_tensors, scheduler_output = await _deser_all()
         t_deser_end = time.perf_counter()
 
         # Compute (serialized — model runner is not concurrent-safe)
         t_compute_start = time.perf_counter()
-        async with self._compute_lock:
-            output = await self._run_step(scheduler_output, intermediate_tensors)
+        try:
+            async with self._compute_lock:
+                output = await self._run_step(scheduler_output, intermediate_tensors)
+        except Exception as e:
+            logger.warning(
+                "[MoLink][TAIL] _run_step failed (VE %s): %s. "
+                "Synthesizing recovery output.",
+                virtual_engine, e,
+            )
+            output = await asyncio.get_running_loop().run_in_executor(
+                None,
+                _synthesize_recovery_output,
+                scheduler_output,
+            )
+            if output is None:
+                raise
         t_compute_end = time.perf_counter()
 
         # Route the result
@@ -225,7 +343,12 @@ class WorkerNodeService(molink_pb2_grpc.MolinkServiceServicer):
         t_push_start = time.perf_counter()
         if is_last_stage:
             head_server = grpc_metadata.get("head")
-            output_bytes = pickle.dumps(output, protocol=pickle.HIGHEST_PROTOCOL)
+            output_bytes = await loop.run_in_executor(
+                None,
+                pickle.dumps,
+                output,
+                pickle.HIGHEST_PROTOCOL,
+            )
             await self._push_sampler_output(output_bytes, virtual_engine, head_server)
         else:
             next_server = server_list[my_idx + 1]
@@ -263,13 +386,34 @@ class WorkerNodeService(molink_pb2_grpc.MolinkServiceServicer):
     # -- internal -----------------------------------------------------------
 
     async def _run_step(self, scheduler_output, intermediate_tensors):
-        """Run execute_model + sample_tokens on the local worker."""
+        """Run execute_model + sample_tokens on the local worker.
+
+        If the model runner is missing state for a cached request
+        (head-tail desync after a lost gRPC response), we synthesize a
+        recovery output so the head can advance the request cleanly
+        instead of crashing the entire pipeline.
+        """
         loop = asyncio.get_running_loop()
         self.worker._molink_set_intermediate_tensors(intermediate_tensors)
 
-        output = await loop.run_in_executor(
-            None, self.worker.execute_model, scheduler_output
-        )
+        try:
+            output = await loop.run_in_executor(
+                None, self.worker.execute_model, scheduler_output
+            )
+        except (KeyError, IndexError, ValueError, RuntimeError) as e:
+            logger.warning(
+                "[MoLink][TAIL] _run_step failed (VE %s): %s. "
+                "Synthesizing recovery output.",
+                getattr(scheduler_output, "virtual_engine", 0), e,
+            )
+            output = await loop.run_in_executor(
+                None,
+                _synthesize_recovery_output,
+                scheduler_output,
+            )
+            if output is not None:
+                return output
+            raise
 
         if output is None:
             stored = self.worker._molink_get_intermediate_tensors()
@@ -329,7 +473,7 @@ class MolinkWorkerNode:
         self.grpc_server: Optional[aio.Server] = None
         self._event_loop: Optional[asyncio.AbstractEventLoop] = None
         self._loop_thread: Optional[threading.Thread] = None
-        self._pool = ThreadPoolExecutor(max_workers=10)
+        self._pool = ThreadPoolExecutor(max_workers=16)
 
         # Initialize MoLink parallel state.
         start_layer, end_layer = self.molink_config.get_serving_layers()
