@@ -7,11 +7,11 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from vllm.config import VllmConfig
-from vllm.distributed.parallel_state import get_pp_group, get_tp_group
+from vllm.distributed.parallel_state import get_pp_group
 from vllm.logger import init_logger
 from vllm.sequence import IntermediateTensors
 from vllm.v1.outputs import ModelRunnerOutput, AsyncModelRunnerOutput
-from vllm.v1.worker.gpu_worker import AsyncIntermediateTensors, Worker
+from vllm.v1.worker.gpu_worker import Worker
 
 logger = init_logger(__name__)
 
@@ -72,38 +72,14 @@ class MolinkWorker(Worker):
     def execute_model(
         self, scheduler_output: "SchedulerOutput"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
-        if self._pp_send_work:
-            for handle in self._pp_send_work:
-                handle.wait()
-            self._pp_send_work = []
-
         intermediate_tensors = None
         forward_pass = scheduler_output.total_num_scheduled_tokens > 0
 
-        is_molink = (
-            hasattr(self.vllm_config, "molink_config")
-            and self.vllm_config.molink_config
-            and self.vllm_config.molink_config.enabled
-        )
-
         if forward_pass and not get_pp_group().is_first_rank:
-            if is_molink:
-                intermediate_tensors = self._molink_get_intermediate_tensors()
-                if not intermediate_tensors:
-                    logger.warning(
-                        "[MoLink][Worker] No intermediate tensors found in local storage!"
-                    )
-            else:
-                tensor_dict, comm_handles, comm_postprocess = (
-                    get_pp_group().irecv_tensor_dict(
-                        all_gather_group=get_tp_group(),
-                    )
-                )
-                assert tensor_dict is not None
-                intermediate_tensors = AsyncIntermediateTensors(
-                    tensor_dict,
-                    comm_handles=comm_handles,
-                    comm_postprocess=comm_postprocess,
+            intermediate_tensors = self._molink_get_intermediate_tensors()
+            if not intermediate_tensors:
+                logger.warning(
+                    "[MoLink][Worker] No intermediate tensors found in local storage!"
                 )
 
         with self.annotate_profile(scheduler_output):
@@ -115,18 +91,9 @@ class MolinkWorker(Worker):
 
         assert isinstance(output, IntermediateTensors)
 
-        if is_molink:
-            if not get_pp_group().is_last_rank:
-                self._molink_set_intermediate_tensors(output)
-            return None
-        else:
-            assert not get_pp_group().is_last_rank
-            self._pp_send_work = get_pp_group().isend_tensor_dict(
-                output.tensors,
-                all_gather_group=get_tp_group(),
-                all_gather_tensors={},
-            )
-            return None
+        if not get_pp_group().is_last_rank:
+            self._molink_set_intermediate_tensors(output)
+        return None
 
 
 def _apply_molink_distributed_patches(vllm_config: VllmConfig, rank: int):

@@ -7,7 +7,7 @@
 ```bash
 cd /home/emnets-2/gxq/molink-measurement/MoLink/benchmark
 
-# 默认：gRPC 传输 + 仅 1gbit/10ms + rps=3（快速验证）
+# MoLink
 ./run_benchmark.sh molink
 
 # 全部系统（MoLink + vLLM）
@@ -15,21 +15,11 @@ cd /home/emnets-2/gxq/molink-measurement/MoLink/benchmark
 
 # 仅 vLLM
 ./run_benchmark.sh vllm
-
-# 使用 NCCL 传输（性能追平 vLLM）
-MOLINK_TRANSPORT=nccl ./run_benchmark.sh molink
 ```
 
 ## 传输模式
 
-MoLink 支持两种跨节点流水线并行传输方式，通过 `MOLINK_TRANSPORT` 环境变量切换：
-
-| 模式 | 环境变量 | 通信栈 | 相对吞吐 | 说明 |
-|------|---------|--------|---------|------|
-| **gRPC**（默认） | `MOLINK_TRANSPORT=grpc` | gRPC + Protobuf | ~67% vLLM | MoLink 原生实现，独立于 vLLM 通信栈 |
-| **NCCL** | `MOLINK_TRANSPORT=nccl` | NCCL via Ray | ~100% vLLM | 复用 vLLM PP 通信，应用 MoLink 层范围 |
-
-### gRPC 模式原理
+MoLink 使用 gRPC + Protobuf 进行跨节点流水线并行通信，独立于 vLLM 通信栈。
 
 ```
 Head 容器 (GPU 1, layers 0-20)          Tail 容器 (GPU 2, layers 21-end)
@@ -41,14 +31,6 @@ Head 容器 (GPU 1, layers 0-20)          Tail 容器 (GPU 2, layers 21-end)
     → 等待 output_queue                       → gRPC PushSamplerOutput ────→
     → 反序列化结果                    ←────────────────────────────────
 ```
-
-每步增加 3-4ms Python/Protobuf/gRPC 开销（相对 NCCL），导致解码吞吐约为 vLLM 的 67%。
-
-### NCCL 模式原理
-
-启动 Ray 集群 → `molink_nccl_server.py` 注入 MoLink 层范围补丁 → 委托 vLLM 原生 PP=2。
-
-张量通信走 NCCL（无 CPU 往返、无序列化），吞吐与 vLLM 基本一致。
 
 ## 前提条件
 
@@ -71,7 +53,6 @@ Head 容器 (GPU 1, layers 0-20)          Tail 容器 (GPU 2, layers 21-end)
 | `DURATION` | 40 | 每轮测试时长（秒） |
 | `COOLDOWN` | 10 | 两轮之间冷却时间（秒） |
 | `MAX_MODEL_LEN` | 4096 | 模型最大上下文长度 |
-| `MOLINK_TRANSPORT` | `grpc` | MoLink 传输模式：`grpc` / `nccl` |
 | `MAX_CONCURRENT_BATCHES` | 2 | MoLink 虚拟引擎数（也可通过 `MOLINK_MAX_CONCURRENT_BATCHES` 环境变量覆盖）|
 | `HEALTH_TIMEOUT` | 300 | 服务启动超时（秒） |
 
@@ -130,5 +111,4 @@ results/<timestamp>/
 - 运行前用 `nvidia-smi` 确认 GPU 无其他进程占用
 - 默认 IP `172.26.0.10/11`，端口 `8080/9095`，确保无冲突
 - 脚本通过 `trap cleanup EXIT` 自动清理容器
-- gRPC 模式下 tail 节点独立启动 health endpoint（`:9095`），NCCL 模式下仅 head 暴露端口
-- NCCL 模式需要容器间 Ray 通信正常（默认端口 `6379`）
+- tail 节点独立启动 health endpoint（`:9095`）
