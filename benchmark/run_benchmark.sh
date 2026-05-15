@@ -3,31 +3,81 @@
 # run_benchmark.sh — Automated benchmark runner for vLLM vs MoLink
 #
 # What it does:
-#   1. Launch two Docker containers (head + tail) on a custom network
+#   1. Launch Docker containers on a custom network
 #   2. Apply tc/netem network shaping (bandwidth + latency)
 #   3. Start either MoLink or vLLM (with Ray)
 #   4. Run the Python benchmark client for each RPS value
 #   5. Collect JSON results and tear down
 #
 # Usage:
-#   ./run_benchmark.sh               # run all (molink + vllm)
-#   ./run_benchmark.sh molink        # only MoLink
-#   ./run_benchmark.sh vllm          # only vLLM
-#   ./run_benchmark.sh molink vllm   # both, explicit
+#   PP_SIZE=2 TP_SIZE=1 ./run_benchmark.sh              # PP=2 (default)
+#   PP_SIZE=2 TP_SIZE=2 ./run_benchmark.sh              # PP=2 + TP=2
+#   PP_SIZE=3 TP_SIZE=1 ./run_benchmark.sh              # PP=3
+#   PP_SIZE=2 TP_SIZE=2 ./run_benchmark.sh molink       # only MoLink
+#   PP_SIZE=2 TP_SIZE=2 ./run_benchmark.sh molink vllm  # both
 # ===========================================================================
 set -euo pipefail
 
 # =========================== CONFIGURATION ==================================
 
+# Pipeline / tensor parallelism (override via env vars)
+PP_SIZE=${PP_SIZE:-2}
+TP_SIZE=${TP_SIZE:-1}
+
+# Validate GPU requirements (GPUs 1-4 available, GPU 0 reserved for host)
+AVAILABLE_GPUS=4
+GPUS_NEEDED=$((PP_SIZE * TP_SIZE))
+if [ "$GPUS_NEEDED" -gt "$AVAILABLE_GPUS" ]; then
+    echo "ERROR: PP=${PP_SIZE} × TP=${TP_SIZE} requires ${GPUS_NEEDED} GPUs, only ${AVAILABLE_GPUS} available" >&2
+    exit 1
+fi
+
 # Docker
 DOCKER_IMAGE="molink:0.1"
 DOCKER_NETWORK="molink"
+
+# Container names / IPs
 C1_NAME="bench-head"
-C2_NAME="bench-tail"
 C1_IP="172.26.0.10"
-C2_IP="172.26.0.11"
-GPU_HEAD=1          # host GPU index for head container
-GPU_TAIL=2          # host GPU index for tail container
+C2_NAME="bench-middle"       # only used when PP_SIZE=3
+C2_IP="172.26.0.12"
+C3_NAME="bench-tail"
+C3_IP="172.26.0.11"
+
+# Compute GPU device lists (Docker --gpus "device=X,Y,...")
+_gpu_list() {
+    local base=$1 count=$2
+    local result=$base i=1
+    while [ "$i" -lt "$count" ]; do
+        result="${result},$((base + i))"
+        i=$((i + 1))
+    done
+    echo "$result"
+}
+# GPU allocation: contiguous groups starting from GPU 0
+# PP=2: head=[0..TP-1], tail=[TP .. 2*TP-1]
+# PP=3: head=[0..TP-1], middle=[TP .. 2*TP-1], tail=[2*TP .. 3*TP-1]
+GPU_HEAD=$(_gpu_list 0 "$TP_SIZE")
+GPU_MIDDLE=$(_gpu_list "$TP_SIZE" "$TP_SIZE")
+if [ "$PP_SIZE" -eq 3 ]; then
+    GPU_TAIL=$(_gpu_list $((2 * TP_SIZE)) "$TP_SIZE")
+else
+    GPU_TAIL=$(_gpu_list "$TP_SIZE" "$TP_SIZE")
+fi
+
+# CUDA_VISIBLE_DEVICES string inside container (Docker remaps device IDs to 0..N)
+CUDA_DEVS=$(seq -s, 0 $((TP_SIZE - 1)))
+
+# Layer split for MoLink (Qwen3-14B: ~40 layers)
+if [ "$PP_SIZE" -eq 3 ]; then
+    HEAD_END_LAYER=14
+    MIDDLE_START=14
+    MIDDLE_END=28
+    TAIL_START=28
+else
+    HEAD_END_LAYER=21
+    TAIL_START=21
+fi
 
 # Paths inside containers
 MODEL_PATH="/gxq/Qwen3-14B"
@@ -38,12 +88,15 @@ VLLM_BIN="/opt/conda/envs/vllm/bin/vllm"
 RAY_BIN="/opt/conda/envs/vllm/bin/ray"
 
 # Ports
-HEAD_HTTP_PORT=8080     # inside container
+HEAD_HTTP_PORT=8080
+HEAD_HOST_PORT=8080
+MIDDLE_HTTP_PORT=9096
+MIDDLE_HOST_PORT=9096
 TAIL_HTTP_PORT=9095
-TAIL_HOST_PORT=9095     # mapped to host
-HEAD_HOST_PORT=8080     # mapped to host
+TAIL_HOST_PORT=9095
 MOLINK_GRPC_HEAD=50061
-MOLINK_GRPC_TAIL=50062
+MOLINK_GRPC_MIDDLE=50062
+MOLINK_GRPC_TAIL=50063
 RAY_PORT=6379
 
 # Network conditions to test: "bandwidth,latency"
@@ -61,9 +114,8 @@ NETWORK_CONDITIONS=(
 INPUT_TOKENS=1024
 OUTPUT_TOKENS=512
 RPS_VALUES=(3)
-DURATION=30            # seconds per benchmark run
-COOLDOWN=10            # seconds to wait between runs
-
+DURATION=30
+COOLDOWN=10
 MAX_MODEL_LEN=4096
 
 # MoLink pipeline config
@@ -75,8 +127,7 @@ TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 RESULTS_DIR="${RESULTS_ROOT}/${TIMESTAMP}"
 BENCHMARK_CLIENT="/home/emnets-2/gxq/molink-measurement/MoLink/benchmark/benchmark_client.py"
 
-# Health check
-HEALTH_TIMEOUT=300     # seconds to wait for service startup
+HEALTH_TIMEOUT=300
 
 # =========================== LOGGING ========================================
 
@@ -88,7 +139,7 @@ die()  { log "ERROR: $*" >&2; exit 1; }
 
 cleanup() {
     log "Cleaning up containers and processes..."
-    docker rm -f "$C1_NAME" "$C2_NAME" 2>/dev/null || true
+    docker rm -f "$C1_NAME" "$C2_NAME" "$C3_NAME" 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -102,7 +153,8 @@ ensure_network() {
 }
 
 start_containers() {
-    log "Starting containers..."
+    log "Starting containers (PP=${PP_SIZE} TP=${TP_SIZE})..."
+
     docker run -d --name "$C1_NAME" \
         -v /mnt/disk1-16/gxq:/data \
         -v /home/emnets-2/gxq:/gxq \
@@ -115,47 +167,69 @@ start_containers() {
         "$DOCKER_IMAGE" \
         sleep infinity
 
-    docker run -d --name "$C2_NAME" \
+    if [ "$PP_SIZE" -eq 3 ]; then
+        docker run -d --name "$C2_NAME" \
+            -v /mnt/disk1-16/gxq:/data \
+            -v /home/emnets-2/gxq:/gxq \
+            --gpus "\"device=${GPU_MIDDLE}\"" \
+            --shm-size=64g \
+            --cap-add=NET_ADMIN \
+            --network "$DOCKER_NETWORK" \
+            --ip "$C2_IP" \
+            -p "${MIDDLE_HOST_PORT}:${MIDDLE_HTTP_PORT}" \
+            "$DOCKER_IMAGE" \
+            sleep infinity
+    fi
+
+    docker run -d --name "$C3_NAME" \
         -v /mnt/disk1-16/gxq:/data \
         -v /home/emnets-2/gxq:/gxq \
         --gpus "\"device=${GPU_TAIL}\"" \
         --shm-size=64g \
         --cap-add=NET_ADMIN \
         --network "$DOCKER_NETWORK" \
-        --ip "$C2_IP" \
+        --ip "$C3_IP" \
         -p "${TAIL_HOST_PORT}:${TAIL_HTTP_PORT}" \
         "$DOCKER_IMAGE" \
         sleep infinity
 
-    log "Containers started ($C1_NAME=$C1_IP  $C2_NAME=$C2_IP)"
+    if [ "$PP_SIZE" -eq 3 ]; then
+        log "Containers started ($C1_NAME=$C1_IP [$GPU_HEAD]  $C2_NAME=$C2_IP [$GPU_MIDDLE]  $C3_NAME=$C3_IP [$GPU_TAIL])"
+    else
+        log "Containers started ($C1_NAME=$C1_IP [$GPU_HEAD]  $C3_NAME=$C3_IP [$GPU_TAIL])"
+    fi
     sleep 5
 }
 
 # =========================== NETWORK SHAPING ================================
 
+_setup_tc() {
+    local container="$1" bw="$2" delay="$3"
+    shift 3
+    docker exec "$container" bash -c "tc qdisc del dev eth0 root 2>/dev/null || true"
+    docker exec "$container" bash -c "tc qdisc add dev eth0 root handle 1: htb default 30"
+    docker exec "$container" bash -c "tc class add dev eth0 parent 1: classid 1:1 htb rate ${bw}"
+    docker exec "$container" bash -c "tc qdisc add dev eth0 parent 1:1 netem delay ${delay}"
+    local prio=1
+    for ip in "$@"; do
+        docker exec "$container" bash -c \
+            "tc filter add dev eth0 parent 1: protocol ip prio ${prio} u32 match ip dst ${ip} flowid 1:1"
+        prio=$((prio + 1))
+    done
+}
+
 setup_network() {
-    local bw="$1"    # e.g. 1gbit
-    local delay="$2" # e.g. 10ms
+    local bw="$1" delay="$2"
+    log "Applying network shaping: ${bw} / ${delay} (PP=${PP_SIZE} TP=${TP_SIZE})"
 
-    log "Applying network shaping: ${bw} / ${delay}"
-
-    # Container 1 → Container 2
-    docker exec "$C1_NAME" bash -c "\
-        tc qdisc del dev eth0 root 2>/dev/null || true; \
-        tc qdisc add dev eth0 root handle 1: htb default 30; \
-        tc class add dev eth0 parent 1: classid 1:1 htb rate ${bw}; \
-        tc qdisc add dev eth0 parent 1:1 netem delay ${delay}; \
-        tc filter add dev eth0 parent 1: protocol ip prio 1 u32 \
-            match ip dst ${C2_IP} flowid 1:1"
-
-    # Container 2 → Container 1
-    docker exec "$C2_NAME" bash -c "\
-        tc qdisc del dev eth0 root 2>/dev/null || true; \
-        tc qdisc add dev eth0 root handle 1: htb default 30; \
-        tc class add dev eth0 parent 1: classid 1:1 htb rate ${bw}; \
-        tc qdisc add dev eth0 parent 1:1 netem delay ${delay}; \
-        tc filter add dev eth0 parent 1: protocol ip prio 1 u32 \
-            match ip dst ${C1_IP} flowid 1:1"
+    if [ "$PP_SIZE" -eq 3 ]; then
+        _setup_tc "$C1_NAME" "$bw" "$delay" "$C2_IP" "$C3_IP"
+        _setup_tc "$C2_NAME" "$bw" "$delay" "$C1_IP" "$C3_IP"
+        _setup_tc "$C3_NAME" "$bw" "$delay" "$C1_IP" "$C2_IP"
+    else
+        _setup_tc "$C1_NAME" "$bw" "$delay" "$C3_IP"
+        _setup_tc "$C3_NAME" "$bw" "$delay" "$C1_IP"
+    fi
 
     log "Network shaping applied."
 }
@@ -163,17 +237,32 @@ setup_network() {
 reset_network() {
     log "Removing network shaping (no limit)..."
     docker exec "$C1_NAME" bash -c "tc qdisc del dev eth0 root 2>/dev/null || true"
-    docker exec "$C2_NAME" bash -c "tc qdisc del dev eth0 root 2>/dev/null || true"
+    docker exec "$C3_NAME" bash -c "tc qdisc del dev eth0 root 2>/dev/null || true"
+    if [ "$PP_SIZE" -eq 3 ]; then
+        docker exec "$C2_NAME" bash -c "tc qdisc del dev eth0 root 2>/dev/null || true"
+    fi
     log "Network shaping removed."
 }
 
 # =========================== SERVICE MANAGEMENT =============================
 
+_pkill_services() {
+    local container="$1"
+    docker exec "$container" bash -c "\
+        pkill -f 'python.*molinkv1' 2>/dev/null || true; \
+        pkill -f 'python.*vllm' 2>/dev/null || true; \
+        pkill -f 'ray::' 2>/dev/null || true; \
+        pkill -f 'raylet' 2>/dev/null || true; \
+        pkill -f 'VLLM' 2>/dev/null || true" || true
+}
+
 stop_services() {
     log "Stopping services inside containers..."
-    # Kill only python/ray processes, not the container's sleep infinity
-    docker exec "$C1_NAME" bash -c "pkill -f 'python.*molinkv1' 2>/dev/null || true; pkill -f 'python.*vllm' 2>/dev/null || true; pkill -f 'ray::' 2>/dev/null || true; pkill -f 'raylet' 2>/dev/null || true; pkill -f 'VLLM' 2>/dev/null || true" || true
-    docker exec "$C2_NAME" bash -c "pkill -f 'python.*molinkv1' 2>/dev/null || true; pkill -f 'python.*vllm' 2>/dev/null || true; pkill -f 'ray::' 2>/dev/null || true; pkill -f 'raylet' 2>/dev/null || true; pkill -f 'VLLM' 2>/dev/null || true" || true
+    _pkill_services "$C1_NAME"
+    _pkill_services "$C3_NAME"
+    if [ "$PP_SIZE" -eq 3 ]; then
+        _pkill_services "$C2_NAME"
+    fi
     sleep 5
 }
 
@@ -186,11 +275,14 @@ wait_for_health() {
         sleep 5
         elapsed=$((elapsed + 5))
         if [ "$elapsed" -ge "$timeout" ]; then
-            # Dump container logs for debugging before failing
             log "=== $C1_NAME logs ==="
             docker exec "$C1_NAME" bash -c "tail -20 /tmp/bench_head.log" 2>/dev/null || true
-            log "=== $C2_NAME logs ==="
-            docker exec "$C2_NAME" bash -c "tail -20 /tmp/bench_tail.log" 2>/dev/null || true
+            log "=== $C3_NAME logs ==="
+            docker exec "$C3_NAME" bash -c "tail -20 /tmp/bench_tail.log" 2>/dev/null || true
+            if [ "$PP_SIZE" -eq 3 ]; then
+                log "=== $C2_NAME logs ==="
+                docker exec "$C2_NAME" bash -c "tail -20 /tmp/bench_middle.log" 2>/dev/null || true
+            fi
             die "Health check timed out after ${timeout}s"
         fi
         if [ $((elapsed % 30)) -eq 0 ]; then
@@ -200,43 +292,49 @@ wait_for_health() {
     log "Service is healthy!"
 }
 
-# ---------- MoLink ----------
+# ---------- MoLink PP=2 ----------
 
-start_molink() {
-    log "Starting MoLink head node (layers 0-20, transport=gRPC)..."
-    docker exec -d -e PYTHONPATH="${MOLINK_CODE}" -e VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=3600 "$C1_NAME" bash -c "\
+start_molink_pp2() {
+    log "Starting MoLink head node (layers 0-${HEAD_END_LAYER}, PP=2 TP=${TP_SIZE})..."
+    docker exec -d -e PYTHONPATH="${MOLINK_CODE}" \
+        -e VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=3600 \
+        "$C1_NAME" bash -c "\
         ${MOLINK_PYTHON} -m molinkv1.entrypoints.api_server \
             --model ${MODEL_PATH} \
-            --molink-grpc-port ${MOLINK_GRPC_HEAD} \
-            --molink-start-layer 0 \
-            --molink-end-layer 21 \
-            --port ${HEAD_HTTP_PORT} \
             --max-model-len ${MAX_MODEL_LEN} \
             --molink-max-concurrent-batches ${MAX_CONCURRENT_BATCHES} \
+            --tensor-parallel-size ${TP_SIZE} \
             --enforce-eager \
             --no-enable-prefix-caching \
+            --molink-grpc-port ${MOLINK_GRPC_HEAD} \
+            --molink-start-layer 0 \
+            --molink-end-layer ${HEAD_END_LAYER} \
+            --port ${HEAD_HTTP_PORT} \
             &>/tmp/bench_head.log"
 
     wait_for_health "http://localhost:${HEAD_HOST_PORT}/health" 300
-    log "Head node is ready. Waiting extra 10s for gRPC stabilization..."
+    log "Head node ready. Waiting 20s for gRPC stabilization..."
     sleep 20
 
-    log "Starting MoLink tail node (layers 21-end, transport=gRPC)..."
-    docker exec -d -e PYTHONPATH="${MOLINK_CODE}" -e VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=3600 "$C2_NAME" bash -c "\
+    log "Starting MoLink tail node (layers ${TAIL_START}-end, PP=2 TP=${TP_SIZE})..."
+    docker exec -d -e PYTHONPATH="${MOLINK_CODE}" \
+        -e VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=3600 \
+        "$C3_NAME" bash -c "\
         ${MOLINK_PYTHON} -m molinkv1.entrypoints.api_server \
             --model ${MODEL_PATH} \
-            --molink-grpc-port ${MOLINK_GRPC_TAIL} \
-            --molink-start-layer 21 \
-            --molink-end-layer -1 \
-            --port ${TAIL_HTTP_PORT} \
             --max-model-len ${MAX_MODEL_LEN} \
             --molink-max-concurrent-batches ${MAX_CONCURRENT_BATCHES} \
-            --molink-initial-peer ${C1_IP}:${MOLINK_GRPC_HEAD} \
+            --tensor-parallel-size ${TP_SIZE} \
             --enforce-eager \
             --no-enable-prefix-caching \
+            --molink-grpc-port ${MOLINK_GRPC_TAIL} \
+            --molink-start-layer ${TAIL_START} \
+            --molink-end-layer -1 \
+            --port ${TAIL_HTTP_PORT} \
+            --molink-initial-peer ${C1_IP}:${MOLINK_GRPC_HEAD} \
             &>/tmp/bench_tail.log"
 
-    log "Waiting for tail node health check on port ${TAIL_HOST_PORT}..."
+    log "Waiting for tail node on port ${TAIL_HOST_PORT}..."
     local elapsed=0
     while ! curl -sf --noproxy localhost "http://localhost:${TAIL_HOST_PORT}/health" >/dev/null 2>&1; do
         sleep 5
@@ -245,35 +343,135 @@ start_molink() {
             die "Tail node health check timed out"
         fi
     done
-    log "Tail node is ready!"
+    log "Tail node ready!"
     sleep 5
+}
+
+# ---------- MoLink PP=3 ----------
+
+start_molink_pp3() {
+    log "Starting MoLink head node (layers 0-${HEAD_END_LAYER}, PP=3 TP=${TP_SIZE})..."
+    docker exec -d -e PYTHONPATH="${MOLINK_CODE}" \
+        -e VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=3600 \
+        "$C1_NAME" bash -c "\
+        ${MOLINK_PYTHON} -m molinkv1.entrypoints.api_server \
+            --model ${MODEL_PATH} \
+            --max-model-len ${MAX_MODEL_LEN} \
+            --molink-max-concurrent-batches ${MAX_CONCURRENT_BATCHES} \
+            --tensor-parallel-size ${TP_SIZE} \
+            --enforce-eager \
+            --no-enable-prefix-caching \
+            --molink-grpc-port ${MOLINK_GRPC_HEAD} \
+            --molink-start-layer 0 \
+            --molink-end-layer ${HEAD_END_LAYER} \
+            --port ${HEAD_HTTP_PORT} \
+            &>/tmp/bench_head.log"
+
+    wait_for_health "http://localhost:${HEAD_HOST_PORT}/health" 300
+    log "Head node ready. Waiting 20s for gRPC stabilization..."
+    sleep 20
+
+    log "Starting MoLink middle node (layers ${MIDDLE_START}-${MIDDLE_END}, PP=3 TP=${TP_SIZE})..."
+    docker exec -d -e PYTHONPATH="${MOLINK_CODE}" \
+        -e VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=3600 \
+        "$C2_NAME" bash -c "\
+        ${MOLINK_PYTHON} -m molinkv1.entrypoints.api_server \
+            --model ${MODEL_PATH} \
+            --max-model-len ${MAX_MODEL_LEN} \
+            --molink-max-concurrent-batches ${MAX_CONCURRENT_BATCHES} \
+            --tensor-parallel-size ${TP_SIZE} \
+            --enforce-eager \
+            --no-enable-prefix-caching \
+            --molink-grpc-port ${MOLINK_GRPC_MIDDLE} \
+            --molink-start-layer ${MIDDLE_START} \
+            --molink-end-layer ${MIDDLE_END} \
+            --port ${MIDDLE_HTTP_PORT} \
+            --molink-initial-peer ${C1_IP}:${MOLINK_GRPC_HEAD} \
+            &>/tmp/bench_middle.log"
+
+    log "Waiting for middle node on port ${MIDDLE_HOST_PORT}..."
+    local elapsed=0
+    while ! curl -sf --noproxy localhost "http://localhost:${MIDDLE_HOST_PORT}/health" >/dev/null 2>&1; do
+        sleep 5
+        elapsed=$((elapsed + 5))
+        if [ "$elapsed" -ge "$HEALTH_TIMEOUT" ]; then
+            die "Middle node health check timed out"
+        fi
+    done
+    log "Middle node ready!"
+    sleep 5
+
+    log "Starting MoLink tail node (layers ${TAIL_START}-end, PP=3 TP=${TP_SIZE})..."
+    docker exec -d -e PYTHONPATH="${MOLINK_CODE}" \
+        -e VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=3600 \
+        "$C3_NAME" bash -c "\
+        ${MOLINK_PYTHON} -m molinkv1.entrypoints.api_server \
+            --model ${MODEL_PATH} \
+            --max-model-len ${MAX_MODEL_LEN} \
+            --molink-max-concurrent-batches ${MAX_CONCURRENT_BATCHES} \
+            --tensor-parallel-size ${TP_SIZE} \
+            --enforce-eager \
+            --no-enable-prefix-caching \
+            --molink-grpc-port ${MOLINK_GRPC_TAIL} \
+            --molink-start-layer ${TAIL_START} \
+            --molink-end-layer -1 \
+            --port ${TAIL_HTTP_PORT} \
+            --molink-initial-peer ${C2_IP}:${MOLINK_GRPC_MIDDLE} \
+            &>/tmp/bench_tail.log"
+
+    log "Waiting for tail node on port ${TAIL_HOST_PORT}..."
+    elapsed=0
+    while ! curl -sf --noproxy localhost "http://localhost:${TAIL_HOST_PORT}/health" >/dev/null 2>&1; do
+        sleep 5
+        elapsed=$((elapsed + 5))
+        if [ "$elapsed" -ge "$HEALTH_TIMEOUT" ]; then
+            die "Tail node health check timed out"
+        fi
+    done
+    log "Tail node ready!"
+    sleep 5
+}
+
+start_molink() {
+    if [ "$PP_SIZE" -eq 3 ]; then
+        start_molink_pp3
+    else
+        start_molink_pp2
+    fi
 }
 
 # ---------- vLLM + Ray ----------
 
 start_vllm() {
-    log "Starting Ray head in container 1..."
+    log "Starting Ray head in $C1_NAME (${TP_SIZE} GPU(s))..."
     docker exec -d "$C1_NAME" bash -c "\
-        CUDA_VISIBLE_DEVICES=0 ${RAY_BIN} start --head \
+        CUDA_VISIBLE_DEVICES=${CUDA_DEVS} ${RAY_BIN} start --head \
             --node-ip-address=${C1_IP} \
-            --port=${RAY_PORT} --num-gpus=1"
-
+            --port=${RAY_PORT} --num-gpus=${TP_SIZE}"
     sleep 8
 
-    log "Starting Ray worker in container 2..."
-    docker exec -d "$C2_NAME" bash -c "\
-        CUDA_VISIBLE_DEVICES=0 ${RAY_BIN} start \
-            --address=${C1_IP}:${RAY_PORT} --num-gpus=1"
+    if [ "$PP_SIZE" -eq 3 ]; then
+        log "Starting Ray worker in $C2_NAME (${TP_SIZE} GPU(s))..."
+        docker exec -d "$C2_NAME" bash -c "\
+            CUDA_VISIBLE_DEVICES=${CUDA_DEVS} ${RAY_BIN} start \
+                --address=${C1_IP}:${RAY_PORT} --num-gpus=${TP_SIZE}"
+        sleep 8
+    fi
 
+    log "Starting Ray worker in $C3_NAME (${TP_SIZE} GPU(s))..."
+    docker exec -d "$C3_NAME" bash -c "\
+        CUDA_VISIBLE_DEVICES=${CUDA_DEVS} ${RAY_BIN} start \
+            --address=${C1_IP}:${RAY_PORT} --num-gpus=${TP_SIZE}"
     sleep 8
 
-    log "Starting vLLM serve (PP=2)..."
+    log "Starting vLLM serve (PP=${PP_SIZE} TP=${TP_SIZE})..."
     docker exec -d "$C1_NAME" bash -c "\
-        CUDA_VISIBLE_DEVICES=0 ${VLLM_BIN} serve \
+        CUDA_VISIBLE_DEVICES=${CUDA_DEVS} ${VLLM_BIN} serve \
             --model ${MODEL_PATH} \
             --port ${HEAD_HTTP_PORT} \
             --max-model-len ${MAX_MODEL_LEN} \
-            --pipeline-parallel-size 2 \
+            --pipeline-parallel-size ${PP_SIZE} \
+            --tensor-parallel-size ${TP_SIZE} \
             --distributed-executor-backend ray \
             --no-enable-prefix-caching \
             --enforce-eager"
@@ -284,8 +482,8 @@ start_vllm() {
 # =========================== BENCHMARK LOOP =================================
 
 run_benchmarks_for() {
-    local system="$1"       # molink | vllm
-    local net_label="$2"    # e.g. bw1gbit_delay10ms
+    local system="$1"
+    local net_label="$2"
 
     local results_subdir="${RESULTS_DIR}/${system}/${net_label}"
     mkdir -p "$results_subdir"
@@ -320,7 +518,7 @@ run_benchmarks_for() {
                 --output "${outdir}/result.json"
         fi
 
-        log "Done: rps=${rps} → ${outdir}/result.json"
+        log "Done: rps=${rps} -> ${outdir}/result.json"
         sleep "$COOLDOWN"
     done
 }
@@ -328,7 +526,6 @@ run_benchmarks_for() {
 # =========================== MAIN ===========================================
 
 main() {
-    # Parse which systems to test
     local systems=()
     if [ $# -eq 0 ]; then
         systems=(molink vllm)
@@ -337,7 +534,12 @@ main() {
     fi
 
     log "==========================================="
-    log " Benchmark suite"
+    log " Benchmark suite  PP=${PP_SIZE}  TP=${TP_SIZE}"
+    log " GPUs needed  : ${GPUS_NEEDED} (${AVAILABLE_GPUS} available)"
+    log " GPU devices  : head=[${GPU_HEAD}]  tail=[${GPU_TAIL}]"
+    if [ "$PP_SIZE" -eq 3 ]; then
+        log "                middle=[${GPU_MIDDLE}]"
+    fi
     log " Systems      : ${systems[*]}"
     log " Network conds: ${NETWORK_CONDITIONS[*]}"
     log " RPS values   : ${RPS_VALUES[*]}"
@@ -347,10 +549,12 @@ main() {
 
     mkdir -p "$RESULTS_DIR"
 
-    # Save run metadata
     cat > "${RESULTS_DIR}/config.json" <<EOF
 {
   "timestamp": "${TIMESTAMP}",
+  "pp_size": ${PP_SIZE},
+  "tp_size": ${TP_SIZE},
+  "gpus_needed": ${GPUS_NEEDED},
   "systems": [$(printf '"%s",' "${systems[@]}" | sed 's/,$//')],
   "network_conditions": [$(printf '"%s",' "${NETWORK_CONDITIONS[@]}" | sed 's/,$//')],
   "input_tokens": ${INPUT_TOKENS},
@@ -360,7 +564,6 @@ main() {
 }
 EOF
 
-    # --- Infrastructure setup ---
     cleanup
     ensure_network
     start_containers
@@ -375,7 +578,7 @@ EOF
                 net_label="bw${bw}_delay${delay}"
             fi
 
-            log "=========== ${system} | ${net_label} ==========="
+            log "=========== ${system} (PP=${PP_SIZE} TP=${TP_SIZE}) | ${net_label} ==========="
 
             if [ "$net_cond" = "none" ]; then
                 reset_network
@@ -391,13 +594,12 @@ EOF
             fi
 
             run_benchmarks_for "$system" "$net_label"
-
             stop_services
         done
     done
 
     log "==========================================="
-    log " All benchmarks complete!"
+    log " All benchmarks complete! (PP=${PP_SIZE} TP=${TP_SIZE})"
     log " Results: ${RESULTS_DIR}"
     log "==========================================="
 }
