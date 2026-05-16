@@ -206,6 +206,11 @@ class MolinkExecutor(MultiprocExecutor):
         self._molink_server_list: list | None = None
         self._molink_grpc_metadata_bytes: bytes | None = None
 
+        # Virtual engine counter for multiplexing concurrent batches.
+        # Each concurrent batch gets a distinct slot so that cross-batch
+        # interference cannot happen even under gRPC errors or timeouts.
+        self._virtual_engine_counter: int = 0
+
         # Initialize parent executor
         super().__init__(vllm_config, monitor_workers=monitor_workers)
 
@@ -415,6 +420,12 @@ class MolinkExecutor(MultiprocExecutor):
         if self.molink_config.is_head_node and not self._is_molink_last_stage():
             if scheduler_output.total_num_scheduled_tokens > 0:
                 t_start = time.perf_counter()
+                # Assign a distinct virtual engine slot to this batch so
+                # concurrent batches do not share the same gRPC queue and
+                # cannot contaminate each other under errors or timeouts.
+                max_ve = self.max_concurrent_batches
+                scheduler_output.virtual_engine = self._virtual_engine_counter
+                self._virtual_engine_counter = (self._virtual_engine_counter + 1) % max_ve
                 # Always run head compute synchronously so intermediate
                 # tensors are ready before sample_tokens.
                 result = super().execute_model(scheduler_output, non_block=False)
