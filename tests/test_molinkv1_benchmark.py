@@ -62,7 +62,7 @@ TAIL_GRPC_PORT = 50062
 HEAD_URL = f"http://localhost:{HEAD_PORT}"
 TAIL_URL = f"http://localhost:{TAIL_PORT}"
 MAX_MODEL_LEN = 4096
-CONDA_PYTHON = "/opt/conda/envs/vllm/bin/python"
+CONDA_PYTHON = "/opt/conda/envs/molinkv19/bin/python"
 HEALTH_TIMEOUT = 600
 HEALTH_INTERVAL = 5
 REQUEST_TIMEOUT = 300
@@ -636,18 +636,19 @@ class ServiceManager:
                      self._config.head_grpc_port, self._config.tail_grpc_port]:
             try:
                 result = subprocess.run(
-                    ["lsof", "-ti", f":{port}"],
+                    ["ss", "-tlnp", f"sport = :{port}"],
                     capture_output=True, text=True, timeout=5,
                 )
-                pids = result.stdout.strip().split()
-                for pid in pids:
-                    pid = pid.strip()
-                    if pid and pid.isdigit():
-                        logger.info("  Killing stale process pid=%s on port %d", pid, port)
-                        try:
-                            os.kill(int(pid), signal.SIGKILL)
-                        except ProcessLookupError:
-                            pass
+                for line in result.stdout.strip().split("\n"):
+                    for part in line.split(","):
+                        if "pid=" in part:
+                            pid = part.split("pid=")[-1].split(",")[0].split(")")[0]
+                            if pid.isdigit():
+                                logger.info("  Killing stale process pid=%s on port %d", pid, port)
+                                try:
+                                    os.kill(int(pid), signal.SIGKILL)
+                                except ProcessLookupError:
+                                    pass
             except Exception:
                 pass
 
@@ -684,12 +685,12 @@ class ServiceManager:
         head_cmd = [
             CONDA_PYTHON, "-m", "molinkv1.entrypoints.api_server",
             "--model", self._config.model_path,
-            "--molink-enabled",
             "--molink-grpc-port", str(self._config.head_grpc_port),
             "--molink-start-layer", "0",
             "--molink-end-layer", str(self._head_end_layer),
             "--port", str(self._config.head_port),
             "--max-model-len", str(self._config.max_model_len),
+            "--enforce-eager",
         ]
         self._head_proc = subprocess.Popen(
             head_cmd, env={**os.environ, "CUDA_VISIBLE_DEVICES": str(self._head_gpu)},
@@ -705,13 +706,13 @@ class ServiceManager:
         tail_cmd = [
             CONDA_PYTHON, "-m", "molinkv1.entrypoints.api_server",
             "--model", self._config.model_path,
-            "--molink-enabled",
             "--molink-grpc-port", str(self._config.tail_grpc_port),
             "--molink-start-layer", str(self._tail_start_layer),
             "--molink-end-layer", "-1",
             "--port", str(self._config.tail_port),
             "--max-model-len", str(self._config.max_model_len),
             "--molink-initial-peer", f"{local_ip}:{self._config.head_grpc_port}",
+            "--enforce-eager",
         ]
         self._tail_proc = subprocess.Popen(
             tail_cmd, env={**os.environ, "CUDA_VISIBLE_DEVICES": str(self._tail_gpu)},

@@ -322,6 +322,10 @@ class WorkerNodeService(molink_pb2_grpc.MolinkServiceServicer):
         loop = asyncio.get_running_loop()
         recv_bytes = 0
 
+        # Queue wait time (from enqueue to processing start)
+        enqueue_time = work_item.get("enqueue_time", t_total_start)
+        queue_wait_ms = (t_total_start - enqueue_time) * 1000 if enqueue_time else 0
+
         # Deserialize (CPU-bound → thread pool)
         t_deser_start = time.perf_counter()
         if "combined_data" in work_item:
@@ -351,8 +355,11 @@ class WorkerNodeService(molink_pb2_grpc.MolinkServiceServicer):
 
         # Compute (serialized — model runner is not concurrent-safe)
         t_compute_start = time.perf_counter()
+        compute_lock_wait_ms = 0
         try:
+            t_lock_acquire = time.perf_counter()
             async with self._compute_lock:
+                compute_lock_wait_ms = (time.perf_counter() - t_lock_acquire) * 1000
                 output = await self._run_step(scheduler_output, intermediate_tensors)
         except Exception as e:
             logger.warning(
@@ -381,14 +388,23 @@ class WorkerNodeService(molink_pb2_grpc.MolinkServiceServicer):
 
         # Push result
         t_push_start = time.perf_counter()
+        t_serialize_result_ms = 0
+        t_grpc_send_ms = 0
         if is_last_stage:
+            t_ser_start = time.perf_counter()
             output_bytes = await loop.run_in_executor(
                 None,
                 pickle.dumps,
                 output,
                 pickle.HIGHEST_PROTOCOL,
             )
+            t_ser_end = time.perf_counter()
+            t_serialize_result_ms = (t_ser_end - t_ser_start) * 1000
+
+            t_grpc_start = time.perf_counter()
             await self._push_sampler_output(output_bytes, virtual_engine, self._cached_head_server)
+            t_grpc_end = time.perf_counter()
+            t_grpc_send_ms = (t_grpc_end - t_grpc_start) * 1000
         else:
             next_server = server_list[my_idx + 1]
             tensors = output.tensors if isinstance(output, IntermediateTensors) else {"hidden_states": output}
@@ -400,12 +416,17 @@ class WorkerNodeService(molink_pb2_grpc.MolinkServiceServicer):
 
         self._record_metric({
             "type": "worker_step",
+            "queue_wait_ms": queue_wait_ms,
             "deserialize_ms": (t_deser_end - t_deser_start) * 1000,
+            "compute_lock_wait_ms": compute_lock_wait_ms,
             "compute_ms": (t_compute_end - t_compute_start) * 1000,
+            "serialize_result_ms": t_serialize_result_ms,
+            "grpc_send_ms": t_grpc_send_ms,
             "push_ms": (t_push_end - t_push_start) * 1000,
             "total_ms": (time.perf_counter() - t_total_start) * 1000,
             "is_last_stage": is_last_stage,
             "recv_bytes": recv_bytes,
+            "result_bytes": len(output_bytes) if is_last_stage else 0,
             "virtual_engine": virtual_engine,
             "timestamp": time.time(),
         })
@@ -446,6 +467,7 @@ class WorkerNodeService(molink_pb2_grpc.MolinkServiceServicer):
             work_item = {
                 "virtual_engine": request.virtual_engine,
                 "combined_data": request.scheduler_output,
+                "enqueue_time": time.perf_counter(),
             }
         else:
             # Legacy format
@@ -456,6 +478,7 @@ class WorkerNodeService(molink_pb2_grpc.MolinkServiceServicer):
                 "virtual_engine": request.virtual_engine,
                 "intermediate_tensors_bytes": intermediate_tensors_bytes,
                 "scheduler_output_bytes": request.scheduler_output,
+                "enqueue_time": time.perf_counter(),
             }
         await self._work_queue.put(work_item)
         return molink_pb2.GrpcResponseData(res=1)

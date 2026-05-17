@@ -363,26 +363,45 @@ class MolinkExecutor(MultiprocExecutor):
         grpc_metadata_bytes: bytes,
         virtual_engine: int,
         next_server: str,
-    ) -> None:
+    ) -> dict:
         """Serialize and send intermediate tensors + scheduler_output to the next stage.
 
         All CPU-bound serialization (pickle + tensor copies) runs in a single
         thread-pool call; the gRPC call is awaited to detect failures early.
+
+        Returns timing dict for instrumentation.
         """
+        timings = {}
         loop = asyncio.get_running_loop()
 
         def _prepare_request():
+            t0 = time.perf_counter()
             sched_bytes = pickle.dumps(scheduler_output, pickle.HIGHEST_PROTOCOL)
+            t_pickle = time.perf_counter()
             combined = _serialize_combined(sched_bytes, tensors)
+            t_serialize = time.perf_counter()
+            timings["pickle_ms"] = (t_pickle - t0) * 1000
+            timings["tensor_serialize_ms"] = (t_serialize - t_pickle) * 1000
+            timings["total_serialize_ms"] = (t_serialize - t0) * 1000
+            timings["serialized_bytes"] = len(combined)
             return molink_pb2.GrpcRequestData(
                 scheduler_output=combined,
                 grpc_metadata=grpc_metadata_bytes,
                 virtual_engine=virtual_engine,
             )
 
+        t_ser_start = time.perf_counter()
         request = await loop.run_in_executor(self._executor_pool, _prepare_request)
+        t_ser_end = time.perf_counter()
+
+        t_grpc_start = time.perf_counter()
         stub = self._get_stub(next_server)
         await stub.PushIntermediateTensors(request)
+        t_grpc_end = time.perf_counter()
+
+        timings["serialize_wall_ms"] = (t_ser_end - t_ser_start) * 1000
+        timings["grpc_send_ms"] = (t_grpc_end - t_grpc_start) * 1000
+        return timings
 
     def _get_stub(self, address: str) -> molink_pb2_grpc.MolinkServiceStub:
         if address not in self._channel_cache:
@@ -557,7 +576,7 @@ class MolinkExecutor(MultiprocExecutor):
             loop = asyncio.get_running_loop()
             next_server = server_list[1]
             t_push_start = time.perf_counter()
-            await self._push_intermediate_tensors(
+            push_timings = await self._push_intermediate_tensors(
                 intermediate_tensors.tensors,
                 scheduler_output,
                 self._molink_grpc_metadata_bytes,
@@ -604,7 +623,7 @@ class MolinkExecutor(MultiprocExecutor):
                 while len(result.sampled_token_ids) < len(all_ids):
                     result.sampled_token_ids.append([0])
 
-            self.molink_service._record_metric({
+            metric = {
                 "type": "head_pipeline",
                 "push_intermediate_ms": (t_push_end - t_push_start) * 1000,
                 "wait_result_ms": (t_wait_end - t_wait_start) * 1000,
@@ -614,7 +633,9 @@ class MolinkExecutor(MultiprocExecutor):
                 "virtual_engine": virtual_engine,
                 "num_servers": len(server_list),
                 "timestamp": time.time(),
-            })
+            }
+            metric.update(push_timings)
+            self.molink_service._record_metric(metric)
 
             return result
 

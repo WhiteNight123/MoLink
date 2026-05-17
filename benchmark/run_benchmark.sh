@@ -33,7 +33,7 @@ if [ "$GPUS_NEEDED" -gt "$AVAILABLE_GPUS" ]; then
 fi
 
 # Docker
-DOCKER_IMAGE="molink:0.1"
+DOCKER_IMAGE="molink:0.2"
 DOCKER_NETWORK="molink"
 
 # Container names / IPs
@@ -83,9 +83,11 @@ fi
 MODEL_PATH="/gxq/Qwen3-14B"
 HOST_TOKENIZER_PATH="/home/emnets-2/gxq/Qwen3-14B"
 MOLINK_CODE="/gxq/molink-measurement/MoLink"
-MOLINK_PYTHON="/opt/conda/envs/vllm/bin/python"
-VLLM_BIN="/opt/conda/envs/vllm/bin/vllm"
-RAY_BIN="/opt/conda/envs/vllm/bin/ray"
+MOLINK_PYTHON="/opt/conda/envs/vllm19/bin/python"
+VLLM_BIN="/opt/conda/envs/vllm19/bin/vllm"
+RAY_BIN="/opt/conda/envs/vllm19/bin/ray"
+VLLM_SITE_PACKAGES="/opt/conda/envs/vllm19/lib/python3.12/site-packages/vllm"
+VLLM_SOURCE="/gxq/molink-measurement/vllm/vllm"
 
 # Ports
 HEAD_HTTP_PORT=8080
@@ -266,6 +268,27 @@ stop_services() {
     sleep 5
 }
 
+deploy_instrumented_vllm() {
+    log "Deploying instrumented vLLM code to containers..."
+    for container in "$C1_NAME" "$C3_NAME"; do
+        docker exec "$container" bash -c "\
+            cp ${VLLM_SOURCE}/v1/executor/ray_executor.py ${VLLM_SITE_PACKAGES}/v1/executor/ray_executor.py && \
+            cp ${VLLM_SOURCE}/v1/executor/ray_utils.py ${VLLM_SITE_PACKAGES}/v1/executor/ray_utils.py && \
+            find ${VLLM_SITE_PACKAGES} -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null; \
+            rm -f /tmp/vllm_metrics.json /tmp/vllm_worker_metrics.json 2>/dev/null || true; \
+            echo done"
+    done
+    if [ "$PP_SIZE" -eq 3 ]; then
+        docker exec "$C2_NAME" bash -c "\
+            cp ${VLLM_SOURCE}/v1/executor/ray_executor.py ${VLLM_SITE_PACKAGES}/v1/executor/ray_executor.py && \
+            cp ${VLLM_SOURCE}/v1/executor/ray_utils.py ${VLLM_SITE_PACKAGES}/v1/executor/ray_utils.py && \
+            find ${VLLM_SITE_PACKAGES} -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null; \
+            rm -f /tmp/vllm_metrics.json /tmp/vllm_worker_metrics.json 2>/dev/null || true; \
+            echo done"
+    fi
+    log "Instrumented vLLM code deployed."
+}
+
 wait_for_health() {
     local url="${1:-http://localhost:${HEAD_HOST_PORT}/health}"
     local timeout="${2:-$HEALTH_TIMEOUT}"
@@ -295,6 +318,13 @@ wait_for_health() {
 # ---------- MoLink PP=2 ----------
 
 start_molink_pp2() {
+    # Clear __pycache__ and stale metrics files
+    for container in "$C1_NAME" "$C3_NAME"; do
+        docker exec "$container" bash -c \
+            "find ${MOLINK_CODE} -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true; \
+             rm -f /tmp/molink_metrics_*.json 2>/dev/null || true" || true
+    done
+
     log "Starting MoLink head node (layers 0-${HEAD_END_LAYER}, PP=2 TP=${TP_SIZE})..."
     docker exec -d -e PYTHONPATH="${MOLINK_CODE}" \
         -e VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=3600 \
@@ -309,6 +339,7 @@ start_molink_pp2() {
             --molink-grpc-port ${MOLINK_GRPC_HEAD} \
             --molink-start-layer 0 \
             --molink-end-layer ${HEAD_END_LAYER} \
+            --molink-enable-metrics \
             --port ${HEAD_HTTP_PORT} \
             &>/tmp/bench_head.log"
 
@@ -330,6 +361,7 @@ start_molink_pp2() {
             --molink-grpc-port ${MOLINK_GRPC_TAIL} \
             --molink-start-layer ${TAIL_START} \
             --molink-end-layer -1 \
+            --molink-enable-metrics \
             --port ${TAIL_HTTP_PORT} \
             --molink-initial-peer ${C1_IP}:${MOLINK_GRPC_HEAD} \
             &>/tmp/bench_tail.log"
@@ -443,9 +475,12 @@ start_molink() {
 # ---------- vLLM + Ray ----------
 
 start_vllm() {
+    deploy_instrumented_vllm
+
     log "Starting Ray head in $C1_NAME (${TP_SIZE} GPU(s))..."
     docker exec -d "$C1_NAME" bash -c "\
-        CUDA_VISIBLE_DEVICES=${CUDA_DEVS} ${RAY_BIN} start --head \
+        CUDA_VISIBLE_DEVICES=${CUDA_DEVS} VLLM_WORKER_METRICS_FILE=/tmp/vllm_worker_metrics.json \
+        ${RAY_BIN} start --head \
             --node-ip-address=${C1_IP} \
             --port=${RAY_PORT} --num-gpus=${TP_SIZE}"
     sleep 8
@@ -453,20 +488,23 @@ start_vllm() {
     if [ "$PP_SIZE" -eq 3 ]; then
         log "Starting Ray worker in $C2_NAME (${TP_SIZE} GPU(s))..."
         docker exec -d "$C2_NAME" bash -c "\
-            CUDA_VISIBLE_DEVICES=${CUDA_DEVS} ${RAY_BIN} start \
+            CUDA_VISIBLE_DEVICES=${CUDA_DEVS} VLLM_WORKER_METRICS_FILE=/tmp/vllm_worker_metrics.json \
+            ${RAY_BIN} start \
                 --address=${C1_IP}:${RAY_PORT} --num-gpus=${TP_SIZE}"
         sleep 8
     fi
 
     log "Starting Ray worker in $C3_NAME (${TP_SIZE} GPU(s))..."
     docker exec -d "$C3_NAME" bash -c "\
-        CUDA_VISIBLE_DEVICES=${CUDA_DEVS} ${RAY_BIN} start \
+        CUDA_VISIBLE_DEVICES=${CUDA_DEVS} VLLM_WORKER_METRICS_FILE=/tmp/vllm_worker_metrics.json \
+        ${RAY_BIN} start \
             --address=${C1_IP}:${RAY_PORT} --num-gpus=${TP_SIZE}"
     sleep 8
 
     log "Starting vLLM serve (PP=${PP_SIZE} TP=${TP_SIZE})..."
     docker exec -d "$C1_NAME" bash -c "\
-        CUDA_VISIBLE_DEVICES=${CUDA_DEVS} ${VLLM_BIN} serve \
+        CUDA_VISIBLE_DEVICES=${CUDA_DEVS} VLLM_METRICS_FILE=/tmp/vllm_metrics.json \
+        ${VLLM_BIN} serve \
             --model ${MODEL_PATH} \
             --port ${HEAD_HTTP_PORT} \
             --max-model-len ${MAX_MODEL_LEN} \
@@ -480,6 +518,41 @@ start_vllm() {
 }
 
 # =========================== BENCHMARK LOOP =================================
+
+collect_metrics() {
+    local system="$1"
+    local outdir="$2"
+
+    log "Collecting ${system} metrics to ${outdir}/..."
+
+    if [ "$system" = "molink" ]; then
+        # Collect MoLink metrics from head and tail containers
+        docker exec "$C1_NAME" bash -c "cat /tmp/molink_metrics_*.json 2>/dev/null || echo '{}'" \
+            > "${outdir}/head_metrics.json" 2>/dev/null || true
+        docker exec "$C3_NAME" bash -c "cat /tmp/molink_metrics_*.json 2>/dev/null || echo '{}'" \
+            > "${outdir}/tail_metrics.json" 2>/dev/null || true
+        if [ "$PP_SIZE" -eq 3 ]; then
+            docker exec "$C2_NAME" bash -c "cat /tmp/molink_metrics_*.json 2>/dev/null || echo '{}'" \
+                > "${outdir}/middle_metrics.json" 2>/dev/null || true
+        fi
+        # Collect HTTP metrics endpoint
+        curl -sf --noproxy localhost "http://localhost:${HEAD_HOST_PORT}/molink_metrics" \
+            > "${outdir}/molink_http_metrics.json" 2>/dev/null || true
+    else
+        # Collect vLLM/Ray metrics from head container
+        docker exec "$C1_NAME" bash -c "cat /tmp/vllm_metrics.json 2>/dev/null || echo '{}'" \
+            > "${outdir}/vllm_metrics.json" 2>/dev/null || true
+        # Collect worker-side metrics from each container
+        docker exec "$C1_NAME" bash -c "cat /tmp/vllm_worker_metrics.json 2>/dev/null || echo '{}'" \
+            > "${outdir}/vllm_worker_head.json" 2>/dev/null || true
+        docker exec "$C3_NAME" bash -c "cat /tmp/vllm_worker_metrics.json 2>/dev/null || echo '{}'" \
+            > "${outdir}/vllm_worker_tail.json" 2>/dev/null || true
+        if [ "$PP_SIZE" -eq 3 ]; then
+            docker exec "$C2_NAME" bash -c "cat /tmp/vllm_worker_metrics.json 2>/dev/null || echo '{}'" \
+                > "${outdir}/vllm_worker_middle.json" 2>/dev/null || true
+        fi
+    fi
+}
 
 run_benchmarks_for() {
     local system="$1"
@@ -518,6 +591,7 @@ run_benchmarks_for() {
                 --output "${outdir}/result.json"
         fi
 
+        collect_metrics "$system" "$outdir"
         log "Done: rps=${rps} -> ${outdir}/result.json"
         sleep "$COOLDOWN"
     done
