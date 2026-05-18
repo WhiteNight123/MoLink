@@ -46,6 +46,11 @@ from molinkv1.worker.worker import MolinkWorker
 logger = init_logger(__name__)
 
 
+def _get_profiler():
+    from molinkv1.profiler import get_profiler
+    return get_profiler()
+
+
 # ---------------------------------------------------------------------------
 # Recovery output synthesiser (handles head-tail desync)
 # ---------------------------------------------------------------------------
@@ -319,6 +324,7 @@ class WorkerNodeService(molink_pb2_grpc.MolinkServiceServicer):
         """Execute the full tail pipeline for one micro-batch (deser → compute → push result)."""
         t_total_start = time.perf_counter()
         virtual_engine = work_item["virtual_engine"]
+        step_id = work_item.get("step_id", -1)
         loop = asyncio.get_running_loop()
         recv_bytes = 0
 
@@ -402,7 +408,7 @@ class WorkerNodeService(molink_pb2_grpc.MolinkServiceServicer):
             t_serialize_result_ms = (t_ser_end - t_ser_start) * 1000
 
             t_grpc_start = time.perf_counter()
-            await self._push_sampler_output(output_bytes, virtual_engine, self._cached_head_server)
+            await self._push_sampler_output(output_bytes, virtual_engine, self._cached_head_server, step_id)
             t_grpc_end = time.perf_counter()
             t_grpc_send_ms = (t_grpc_end - t_grpc_start) * 1000
         else:
@@ -430,6 +436,20 @@ class WorkerNodeService(molink_pb2_grpc.MolinkServiceServicer):
             "virtual_engine": virtual_engine,
             "timestamp": time.time(),
         })
+
+        profiler = _get_profiler()
+        if profiler is not None:
+            profiler.record("tail_step", {
+                "queue_wait_ms": queue_wait_ms,
+                "deserialize_ms": (t_deser_end - t_deser_start) * 1000,
+                "compute_lock_wait_ms": compute_lock_wait_ms,
+                "compute_ms": (t_compute_end - t_compute_start) * 1000,
+                "serialize_result_ms": t_serialize_result_ms,
+                "grpc_send_ms": t_grpc_send_ms,
+                "total_ms": (time.perf_counter() - t_total_start) * 1000,
+                "recv_bytes": recv_bytes,
+                "result_bytes": len(output_bytes) if is_last_stage else 0,
+            }, step_id=step_id)
 
     def _get_stub(self, address: str) -> molink_pb2_grpc.MolinkServiceStub:
         if address not in self._stub_cache:
@@ -468,6 +488,7 @@ class WorkerNodeService(molink_pb2_grpc.MolinkServiceServicer):
                 "virtual_engine": request.virtual_engine,
                 "combined_data": request.scheduler_output,
                 "enqueue_time": time.perf_counter(),
+                "step_id": request.step_id,
             }
         else:
             # Legacy format
@@ -479,6 +500,7 @@ class WorkerNodeService(molink_pb2_grpc.MolinkServiceServicer):
                 "intermediate_tensors_bytes": intermediate_tensors_bytes,
                 "scheduler_output_bytes": request.scheduler_output,
                 "enqueue_time": time.perf_counter(),
+                "step_id": request.step_id,
             }
         await self._work_queue.put(work_item)
         return molink_pb2.GrpcResponseData(res=1)
@@ -541,9 +563,9 @@ class WorkerNodeService(molink_pb2_grpc.MolinkServiceServicer):
 
         return output
 
-    async def _push_sampler_output(self, output_bytes, virtual_engine, head_server):
+    async def _push_sampler_output(self, output_bytes, virtual_engine, head_server, step_id=-1):
         request = molink_pb2.SamplerOutput(
-            output_data=output_bytes, virtual_engine=virtual_engine
+            output_data=output_bytes, virtual_engine=virtual_engine, step_id=step_id
         )
         stub = self._get_stub(head_server)
         await stub.PushSamplerOutput(request)
@@ -743,6 +765,16 @@ class MolinkWorkerNode:
         service._ip = self.ip
         service._grpc_port = self.grpc_port
         service._metrics_enabled = config.enable_metrics
+        if config.enable_metrics:
+            from molinkv1.profiler import init_profiler
+            import os
+            profiler_dir = os.environ.get("MOLINK_PROFILER_DIR", "/tmp/molink_profile")
+            init_profiler(profiler_dir, f"tail_{self.grpc_port}")
+            self._shutdown_event = threading.Event()
+            self._metrics_flush_thread = threading.Thread(
+                target=self._metrics_flush_loop, daemon=True, name="MolinkTailMetricsFlush"
+            )
+            self._metrics_flush_thread.start()
         service.start_background_worker()
         self.service = service
 
@@ -793,6 +825,12 @@ class MolinkWorkerNode:
         from molinkv1.parallel_state import destroy_molink_parallel_state
         destroy_molink_parallel_state()
 
+        if hasattr(self, '_shutdown_event'):
+            self._shutdown_event.set()
+        if hasattr(self, '_metrics_flush_thread') and self._metrics_flush_thread.is_alive():
+            self._flush_metrics_to_file()
+            self._metrics_flush_thread.join(timeout=3)
+
         if self._event_loop and self._event_loop.is_running():
             future = asyncio.run_coroutine_threadsafe(self._async_shutdown(), self._event_loop)
             try:
@@ -829,3 +867,24 @@ class MolinkWorkerNode:
     def reset_communication_metrics(self):
         if hasattr(self, 'service') and self.service is not None:
             self.service.reset_metrics()
+
+    def _flush_metrics_to_file(self):
+        import json
+        import tempfile
+        data = self.get_communication_metrics()
+        path = os.path.join(tempfile.gettempdir(), f"molink_metrics_{self.grpc_port}.json")
+        try:
+            tmp_path = path + ".tmp"
+            with open(tmp_path, "w") as f:
+                json.dump(data, f)
+            os.replace(tmp_path, path)
+        except Exception:
+            pass
+
+    def _metrics_flush_loop(self):
+        while not self._shutdown_event.is_set():
+            self._shutdown_event.wait(timeout=2.0)
+            try:
+                self._flush_metrics_to_file()
+            except Exception:
+                pass

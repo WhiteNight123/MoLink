@@ -26,6 +26,7 @@ from vllm.logger import init_logger
 from vllm.v1.executor.multiproc_executor import MultiprocExecutor
 from vllm.v1.outputs import ModelRunnerOutput
 
+from molinkv1.profiler import get_profiler
 from molinkv1.service import MolinkService
 from molinkv1.utils import (
     extract_ip,
@@ -211,6 +212,9 @@ class MolinkExecutor(MultiprocExecutor):
         # interference cannot happen even under gRPC errors or timeouts.
         self._virtual_engine_counter: int = 0
 
+        # Pipeline step counter for profiling correlation.
+        self._step_id_counter: int = 0
+
         # Initialize parent executor
         super().__init__(vllm_config, monitor_workers=monitor_workers)
 
@@ -274,6 +278,9 @@ class MolinkExecutor(MultiprocExecutor):
 
         # Start periodic metrics flush to temp file (read by api_server).
         if config.enable_metrics:
+            from molinkv1.profiler import init_profiler
+            profiler_dir = os.environ.get("MOLINK_PROFILER_DIR", "/tmp/molink_profile")
+            init_profiler(profiler_dir, f"head_{self.grpc_port}")
             self._metrics_flush_thread = threading.Thread(
                 target=self._metrics_flush_loop, daemon=True, name="MolinkMetricsFlush"
             )
@@ -363,6 +370,7 @@ class MolinkExecutor(MultiprocExecutor):
         grpc_metadata_bytes: bytes,
         virtual_engine: int,
         next_server: str,
+        step_id: int = -1,
     ) -> dict:
         """Serialize and send intermediate tensors + scheduler_output to the next stage.
 
@@ -388,6 +396,7 @@ class MolinkExecutor(MultiprocExecutor):
                 scheduler_output=combined,
                 grpc_metadata=grpc_metadata_bytes,
                 virtual_engine=virtual_engine,
+                step_id=step_id,
             )
 
         t_ser_start = time.perf_counter()
@@ -401,6 +410,9 @@ class MolinkExecutor(MultiprocExecutor):
 
         timings["serialize_wall_ms"] = (t_ser_end - t_ser_start) * 1000
         timings["grpc_send_ms"] = (t_grpc_end - t_grpc_start) * 1000
+        profiler = get_profiler()
+        if profiler is not None:
+            profiler.record("head_push", timings, step_id=step_id)
         return timings
 
     def _get_stub(self, address: str) -> molink_pb2_grpc.MolinkServiceStub:
@@ -439,15 +451,19 @@ class MolinkExecutor(MultiprocExecutor):
         if self.molink_config.is_head_node and not self._is_molink_last_stage():
             if scheduler_output.total_num_scheduled_tokens > 0:
                 t_start = time.perf_counter()
+                step_id = self._step_id_counter
+                self._step_id_counter += 1
                 # Assign a distinct virtual engine slot to this batch so
                 # concurrent batches do not share the same gRPC queue and
                 # cannot contaminate each other under errors or timeouts.
                 max_ve = self.max_concurrent_batches
                 scheduler_output.virtual_engine = self._virtual_engine_counter
                 self._virtual_engine_counter = (self._virtual_engine_counter + 1) % max_ve
+                scheduler_output._molink_step_id = step_id
                 # Always run head compute synchronously so intermediate
                 # tensors are ready before sample_tokens.
                 result = super().execute_model(scheduler_output, non_block=False)
+                t_after_compute = time.perf_counter()
                 # Retrieve intermediate tensors immediately in the engine
                 # thread to avoid RPC races with _do_pipeline coroutines.
                 tensors_result = MultiprocExecutor.collective_rpc(
@@ -458,12 +474,28 @@ class MolinkExecutor(MultiprocExecutor):
                 # on this same thread — gets the right data without any
                 # queue that the event loop could reorder.
                 self._pending_pipeline_data = (scheduler_output, intermediate)
+                head_compute_ms = (t_after_compute - t_start) * 1000
+                head_total_ms = (time.perf_counter() - t_start) * 1000
                 self.molink_service._record_metric({
                     "type": "head_compute",
-                    "compute_ms": (time.perf_counter() - t_start) * 1000,
+                    "compute_ms": head_total_ms,
                     "num_tokens": scheduler_output.total_num_scheduled_tokens,
                     "timestamp": time.time(),
                 })
+                profiler = get_profiler()
+                if profiler is not None:
+                    tensor_size_mb = 0
+                    if intermediate is not None:
+                        for t in intermediate.tensors.values():
+                            tensor_size_mb += t.element_size() * t.nelement()
+                        tensor_size_mb /= 1024 * 1024
+                    profiler.record("head_compute", {
+                        "head_compute_ms": head_compute_ms,
+                        "head_total_ms": head_total_ms,
+                        "num_tokens": scheduler_output.total_num_scheduled_tokens,
+                        "tensor_size_mb": round(tensor_size_mb, 2),
+                        "virtual_engine": scheduler_output.virtual_engine,
+                    }, step_id=step_id)
                 # When engine core requested non_block, wrap the result
                 # in an already-resolved Future.
                 if non_block:
@@ -550,6 +582,7 @@ class MolinkExecutor(MultiprocExecutor):
                 )
 
             virtual_engine = getattr(scheduler_output, "virtual_engine", 0)
+            step_id = getattr(scheduler_output, "_molink_step_id", -1)
 
             # 2. Get pipeline metadata (cached after first call).
             server_list = self._molink_server_list
@@ -582,6 +615,7 @@ class MolinkExecutor(MultiprocExecutor):
                 self._molink_grpc_metadata_bytes,
                 virtual_engine,
                 next_server,
+                step_id=step_id,
             )
             t_push_end = time.perf_counter()
 
@@ -636,6 +670,15 @@ class MolinkExecutor(MultiprocExecutor):
             }
             metric.update(push_timings)
             self.molink_service._record_metric(metric)
+
+            profiler = get_profiler()
+            if profiler is not None:
+                profiler.record("head_pipeline", {
+                    "total_pipeline_ms": metric["total_pipeline_ms"],
+                    "wait_result_ms": metric["wait_result_ms"],
+                    "deserialize_result_ms": metric["deserialize_result_ms"],
+                    "result_bytes": metric["result_bytes"],
+                }, step_id=step_id, virtual_engine=virtual_engine)
 
             return result
 

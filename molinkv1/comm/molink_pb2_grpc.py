@@ -3,7 +3,7 @@
 import grpc
 import warnings
 
-from molinkv1.comm import molink_pb2 as molink__pb2
+from molinkv1.comm import molink_pb2 as molinkv1_dot_comm_dot_molink__pb2
 
 GRPC_GENERATED_VERSION = '1.80.0'
 GRPC_VERSION = grpc.__version__
@@ -18,7 +18,7 @@ except ImportError:
 if _version_not_supported:
     raise RuntimeError(
         f'The grpc package installed is at version {GRPC_VERSION},'
-        + ' but the generated code in molink_pb2_grpc.py depends on'
+        + ' but the generated code in molinkv1/comm/molink_pb2_grpc.py depends on'
         + f' grpcio>={GRPC_GENERATED_VERSION}.'
         + f' Please upgrade your grpc module to grpcio>={GRPC_GENERATED_VERSION}'
         + f' or downgrade your generated code using grpcio-tools<={GRPC_VERSION}.'
@@ -37,48 +37,48 @@ class MolinkServiceStub(object):
         """
         self.JoinPipeline = channel.unary_unary(
                 '/molink.MolinkService/JoinPipeline',
-                request_serializer=molink__pb2.NodeInfo.SerializeToString,
-                response_deserializer=molink__pb2.GrpcResponseData.FromString,
+                request_serializer=molinkv1_dot_comm_dot_molink__pb2.NodeInfo.SerializeToString,
+                response_deserializer=molinkv1_dot_comm_dot_molink__pb2.GrpcResponseData.FromString,
                 _registered_method=True)
         self.GetTopology = channel.unary_unary(
                 '/molink.MolinkService/GetTopology',
-                request_serializer=molink__pb2.HealthCheckRequest.SerializeToString,
-                response_deserializer=molink__pb2.PipelineTopology.FromString,
+                request_serializer=molinkv1_dot_comm_dot_molink__pb2.HealthCheckRequest.SerializeToString,
+                response_deserializer=molinkv1_dot_comm_dot_molink__pb2.PipelineTopology.FromString,
                 _registered_method=True)
         self.PushIntermediateTensors = channel.unary_unary(
                 '/molink.MolinkService/PushIntermediateTensors',
-                request_serializer=molink__pb2.GrpcRequestData.SerializeToString,
-                response_deserializer=molink__pb2.GrpcResponseData.FromString,
+                request_serializer=molinkv1_dot_comm_dot_molink__pb2.GrpcRequestData.SerializeToString,
+                response_deserializer=molinkv1_dot_comm_dot_molink__pb2.GrpcResponseData.FromString,
                 _registered_method=True)
         self.PushSamplerOutput = channel.unary_unary(
                 '/molink.MolinkService/PushSamplerOutput',
-                request_serializer=molink__pb2.SamplerOutput.SerializeToString,
-                response_deserializer=molink__pb2.GrpcResponseData.FromString,
+                request_serializer=molinkv1_dot_comm_dot_molink__pb2.SamplerOutput.SerializeToString,
+                response_deserializer=molinkv1_dot_comm_dot_molink__pb2.GrpcResponseData.FromString,
                 _registered_method=True)
         self.ExecuteWorkerStep = channel.unary_unary(
                 '/molink.MolinkService/ExecuteWorkerStep',
-                request_serializer=molink__pb2.GrpcTriggerRequest.SerializeToString,
-                response_deserializer=molink__pb2.GrpcResponseData.FromString,
+                request_serializer=molinkv1_dot_comm_dot_molink__pb2.GrpcTriggerRequest.SerializeToString,
+                response_deserializer=molinkv1_dot_comm_dot_molink__pb2.GrpcResponseData.FromString,
                 _registered_method=True)
         self.SyncKVCacheConfig = channel.unary_unary(
                 '/molink.MolinkService/SyncKVCacheConfig',
-                request_serializer=molink__pb2.KVCacheConfigData.SerializeToString,
-                response_deserializer=molink__pb2.GrpcResponseData.FromString,
+                request_serializer=molinkv1_dot_comm_dot_molink__pb2.KVCacheConfigData.SerializeToString,
+                response_deserializer=molinkv1_dot_comm_dot_molink__pb2.GrpcResponseData.FromString,
                 _registered_method=True)
         self.InitializeModel = channel.unary_unary(
                 '/molink.MolinkService/InitializeModel',
-                request_serializer=molink__pb2.ModelConfigData.SerializeToString,
-                response_deserializer=molink__pb2.GrpcResponseData.FromString,
+                request_serializer=molinkv1_dot_comm_dot_molink__pb2.ModelConfigData.SerializeToString,
+                response_deserializer=molinkv1_dot_comm_dot_molink__pb2.GrpcResponseData.FromString,
                 _registered_method=True)
         self.HealthCheck = channel.unary_unary(
                 '/molink.MolinkService/HealthCheck',
-                request_serializer=molink__pb2.HealthCheckRequest.SerializeToString,
-                response_deserializer=molink__pb2.HealthCheckResponse.FromString,
+                request_serializer=molinkv1_dot_comm_dot_molink__pb2.HealthCheckRequest.SerializeToString,
+                response_deserializer=molinkv1_dot_comm_dot_molink__pb2.HealthCheckResponse.FromString,
                 _registered_method=True)
         self.Shutdown = channel.unary_unary(
                 '/molink.MolinkService/Shutdown',
-                request_serializer=molink__pb2.HealthCheckRequest.SerializeToString,
-                response_deserializer=molink__pb2.GrpcResponseData.FromString,
+                request_serializer=molinkv1_dot_comm_dot_molink__pb2.HealthCheckRequest.SerializeToString,
+                response_deserializer=molinkv1_dot_comm_dot_molink__pb2.GrpcResponseData.FromString,
                 _registered_method=True)
 
 
@@ -154,48 +154,48 @@ def add_MolinkServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
             'JoinPipeline': grpc.unary_unary_rpc_method_handler(
                     servicer.JoinPipeline,
-                    request_deserializer=molink__pb2.NodeInfo.FromString,
-                    response_serializer=molink__pb2.GrpcResponseData.SerializeToString,
+                    request_deserializer=molinkv1_dot_comm_dot_molink__pb2.NodeInfo.FromString,
+                    response_serializer=molinkv1_dot_comm_dot_molink__pb2.GrpcResponseData.SerializeToString,
             ),
             'GetTopology': grpc.unary_unary_rpc_method_handler(
                     servicer.GetTopology,
-                    request_deserializer=molink__pb2.HealthCheckRequest.FromString,
-                    response_serializer=molink__pb2.PipelineTopology.SerializeToString,
+                    request_deserializer=molinkv1_dot_comm_dot_molink__pb2.HealthCheckRequest.FromString,
+                    response_serializer=molinkv1_dot_comm_dot_molink__pb2.PipelineTopology.SerializeToString,
             ),
             'PushIntermediateTensors': grpc.unary_unary_rpc_method_handler(
                     servicer.PushIntermediateTensors,
-                    request_deserializer=molink__pb2.GrpcRequestData.FromString,
-                    response_serializer=molink__pb2.GrpcResponseData.SerializeToString,
+                    request_deserializer=molinkv1_dot_comm_dot_molink__pb2.GrpcRequestData.FromString,
+                    response_serializer=molinkv1_dot_comm_dot_molink__pb2.GrpcResponseData.SerializeToString,
             ),
             'PushSamplerOutput': grpc.unary_unary_rpc_method_handler(
                     servicer.PushSamplerOutput,
-                    request_deserializer=molink__pb2.SamplerOutput.FromString,
-                    response_serializer=molink__pb2.GrpcResponseData.SerializeToString,
+                    request_deserializer=molinkv1_dot_comm_dot_molink__pb2.SamplerOutput.FromString,
+                    response_serializer=molinkv1_dot_comm_dot_molink__pb2.GrpcResponseData.SerializeToString,
             ),
             'ExecuteWorkerStep': grpc.unary_unary_rpc_method_handler(
                     servicer.ExecuteWorkerStep,
-                    request_deserializer=molink__pb2.GrpcTriggerRequest.FromString,
-                    response_serializer=molink__pb2.GrpcResponseData.SerializeToString,
+                    request_deserializer=molinkv1_dot_comm_dot_molink__pb2.GrpcTriggerRequest.FromString,
+                    response_serializer=molinkv1_dot_comm_dot_molink__pb2.GrpcResponseData.SerializeToString,
             ),
             'SyncKVCacheConfig': grpc.unary_unary_rpc_method_handler(
                     servicer.SyncKVCacheConfig,
-                    request_deserializer=molink__pb2.KVCacheConfigData.FromString,
-                    response_serializer=molink__pb2.GrpcResponseData.SerializeToString,
+                    request_deserializer=molinkv1_dot_comm_dot_molink__pb2.KVCacheConfigData.FromString,
+                    response_serializer=molinkv1_dot_comm_dot_molink__pb2.GrpcResponseData.SerializeToString,
             ),
             'InitializeModel': grpc.unary_unary_rpc_method_handler(
                     servicer.InitializeModel,
-                    request_deserializer=molink__pb2.ModelConfigData.FromString,
-                    response_serializer=molink__pb2.GrpcResponseData.SerializeToString,
+                    request_deserializer=molinkv1_dot_comm_dot_molink__pb2.ModelConfigData.FromString,
+                    response_serializer=molinkv1_dot_comm_dot_molink__pb2.GrpcResponseData.SerializeToString,
             ),
             'HealthCheck': grpc.unary_unary_rpc_method_handler(
                     servicer.HealthCheck,
-                    request_deserializer=molink__pb2.HealthCheckRequest.FromString,
-                    response_serializer=molink__pb2.HealthCheckResponse.SerializeToString,
+                    request_deserializer=molinkv1_dot_comm_dot_molink__pb2.HealthCheckRequest.FromString,
+                    response_serializer=molinkv1_dot_comm_dot_molink__pb2.HealthCheckResponse.SerializeToString,
             ),
             'Shutdown': grpc.unary_unary_rpc_method_handler(
                     servicer.Shutdown,
-                    request_deserializer=molink__pb2.HealthCheckRequest.FromString,
-                    response_serializer=molink__pb2.GrpcResponseData.SerializeToString,
+                    request_deserializer=molinkv1_dot_comm_dot_molink__pb2.HealthCheckRequest.FromString,
+                    response_serializer=molinkv1_dot_comm_dot_molink__pb2.GrpcResponseData.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -224,8 +224,8 @@ class MolinkService(object):
             request,
             target,
             '/molink.MolinkService/JoinPipeline',
-            molink__pb2.NodeInfo.SerializeToString,
-            molink__pb2.GrpcResponseData.FromString,
+            molinkv1_dot_comm_dot_molink__pb2.NodeInfo.SerializeToString,
+            molinkv1_dot_comm_dot_molink__pb2.GrpcResponseData.FromString,
             options,
             channel_credentials,
             insecure,
@@ -251,8 +251,8 @@ class MolinkService(object):
             request,
             target,
             '/molink.MolinkService/GetTopology',
-            molink__pb2.HealthCheckRequest.SerializeToString,
-            molink__pb2.PipelineTopology.FromString,
+            molinkv1_dot_comm_dot_molink__pb2.HealthCheckRequest.SerializeToString,
+            molinkv1_dot_comm_dot_molink__pb2.PipelineTopology.FromString,
             options,
             channel_credentials,
             insecure,
@@ -278,8 +278,8 @@ class MolinkService(object):
             request,
             target,
             '/molink.MolinkService/PushIntermediateTensors',
-            molink__pb2.GrpcRequestData.SerializeToString,
-            molink__pb2.GrpcResponseData.FromString,
+            molinkv1_dot_comm_dot_molink__pb2.GrpcRequestData.SerializeToString,
+            molinkv1_dot_comm_dot_molink__pb2.GrpcResponseData.FromString,
             options,
             channel_credentials,
             insecure,
@@ -305,8 +305,8 @@ class MolinkService(object):
             request,
             target,
             '/molink.MolinkService/PushSamplerOutput',
-            molink__pb2.SamplerOutput.SerializeToString,
-            molink__pb2.GrpcResponseData.FromString,
+            molinkv1_dot_comm_dot_molink__pb2.SamplerOutput.SerializeToString,
+            molinkv1_dot_comm_dot_molink__pb2.GrpcResponseData.FromString,
             options,
             channel_credentials,
             insecure,
@@ -332,8 +332,8 @@ class MolinkService(object):
             request,
             target,
             '/molink.MolinkService/ExecuteWorkerStep',
-            molink__pb2.GrpcTriggerRequest.SerializeToString,
-            molink__pb2.GrpcResponseData.FromString,
+            molinkv1_dot_comm_dot_molink__pb2.GrpcTriggerRequest.SerializeToString,
+            molinkv1_dot_comm_dot_molink__pb2.GrpcResponseData.FromString,
             options,
             channel_credentials,
             insecure,
@@ -359,8 +359,8 @@ class MolinkService(object):
             request,
             target,
             '/molink.MolinkService/SyncKVCacheConfig',
-            molink__pb2.KVCacheConfigData.SerializeToString,
-            molink__pb2.GrpcResponseData.FromString,
+            molinkv1_dot_comm_dot_molink__pb2.KVCacheConfigData.SerializeToString,
+            molinkv1_dot_comm_dot_molink__pb2.GrpcResponseData.FromString,
             options,
             channel_credentials,
             insecure,
@@ -386,8 +386,8 @@ class MolinkService(object):
             request,
             target,
             '/molink.MolinkService/InitializeModel',
-            molink__pb2.ModelConfigData.SerializeToString,
-            molink__pb2.GrpcResponseData.FromString,
+            molinkv1_dot_comm_dot_molink__pb2.ModelConfigData.SerializeToString,
+            molinkv1_dot_comm_dot_molink__pb2.GrpcResponseData.FromString,
             options,
             channel_credentials,
             insecure,
@@ -413,8 +413,8 @@ class MolinkService(object):
             request,
             target,
             '/molink.MolinkService/HealthCheck',
-            molink__pb2.HealthCheckRequest.SerializeToString,
-            molink__pb2.HealthCheckResponse.FromString,
+            molinkv1_dot_comm_dot_molink__pb2.HealthCheckRequest.SerializeToString,
+            molinkv1_dot_comm_dot_molink__pb2.HealthCheckResponse.FromString,
             options,
             channel_credentials,
             insecure,
@@ -440,8 +440,8 @@ class MolinkService(object):
             request,
             target,
             '/molink.MolinkService/Shutdown',
-            molink__pb2.HealthCheckRequest.SerializeToString,
-            molink__pb2.GrpcResponseData.FromString,
+            molinkv1_dot_comm_dot_molink__pb2.HealthCheckRequest.SerializeToString,
+            molinkv1_dot_comm_dot_molink__pb2.GrpcResponseData.FromString,
             options,
             channel_credentials,
             insecure,
