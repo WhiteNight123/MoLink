@@ -46,11 +46,6 @@ from molinkv1.worker.worker import MolinkWorker
 logger = init_logger(__name__)
 
 
-def _get_profiler():
-    from molinkv1.profiler import get_profiler
-    return get_profiler()
-
-
 # ---------------------------------------------------------------------------
 # Recovery output synthesiser (handles head-tail desync)
 # ---------------------------------------------------------------------------
@@ -360,7 +355,11 @@ class WorkerNodeService(molink_pb2_grpc.MolinkServiceServicer):
     # -- Split phases for pre-fetch pipelining ---------------------------------
 
     async def _deserialize_work_item(self, work_item: dict):
-        """CPU-bound deserialization (runs in thread pool)."""
+        """CPU-bound deserialization (runs in thread pool).
+
+        Returns (intermediate_tensors, scheduler_output, work_item, recv_bytes, deser_ms).
+        """
+        t_start = time.perf_counter()
         loop = asyncio.get_running_loop()
         if "combined_data" in work_item:
             def _deser_combined():
@@ -386,13 +385,14 @@ class WorkerNodeService(molink_pb2_grpc.MolinkServiceServicer):
                     pickle.loads(scheduler_output_bytes),
                 ),
             )
+        deser_ms = (time.perf_counter() - t_start) * 1000
         return (
-            intermediate_tensors, scheduler_output, work_item, recv_bytes,
+            intermediate_tensors, scheduler_output, work_item, recv_bytes, deser_ms,
         )
 
     async def _compute_and_push(self, deserialized):
         """GPU compute + result serialization + gRPC push."""
-        intermediate_tensors, scheduler_output, work_item, recv_bytes = deserialized
+        intermediate_tensors, scheduler_output, work_item, recv_bytes, deser_ms = deserialized
         t_total_start = time.perf_counter()
         virtual_engine = work_item["virtual_engine"]
         step_id = work_item.get("step_id", -1)
@@ -467,10 +467,12 @@ class WorkerNodeService(molink_pb2_grpc.MolinkServiceServicer):
             )
         t_push_end = time.perf_counter()
 
+        req_ids = list(getattr(scheduler_output, "num_scheduled_tokens", {}).keys())
+
         self._record_metric({
             "type": "worker_step",
             "queue_wait_ms": queue_wait_ms,
-            "deserialize_ms": 0,  # measured separately by pre-fetch
+            "deserialize_ms": deser_ms,
             "compute_lock_wait_ms": compute_lock_wait_ms,
             "compute_ms": (t_compute_end - t_compute_start) * 1000,
             "serialize_result_ms": t_serialize_result_ms,
@@ -482,20 +484,8 @@ class WorkerNodeService(molink_pb2_grpc.MolinkServiceServicer):
             "result_bytes": len(output_bytes) if is_last_stage else 0,
             "virtual_engine": virtual_engine,
             "timestamp": time.time(),
+            "req_ids": req_ids,
         })
-
-        profiler = _get_profiler()
-        if profiler is not None:
-            profiler.record("tail_step", {
-                "queue_wait_ms": queue_wait_ms,
-                "compute_lock_wait_ms": compute_lock_wait_ms,
-                "compute_ms": (t_compute_end - t_compute_start) * 1000,
-                "serialize_result_ms": t_serialize_result_ms,
-                "grpc_send_ms": t_grpc_send_ms,
-                "total_ms": (time.perf_counter() - t_total_start) * 1000,
-                "recv_bytes": recv_bytes,
-                "result_bytes": len(output_bytes) if is_last_stage else 0,
-            }, step_id=step_id)
 
     def _get_stub(self, address: str) -> molink_pb2_grpc.MolinkServiceStub:
         if address not in self._stub_cache:
@@ -520,6 +510,7 @@ class WorkerNodeService(molink_pb2_grpc.MolinkServiceServicer):
 
     async def PushIntermediateTensors(self, request, context):
         """Enqueue work and return immediately so the head is not blocked by tail compute."""
+        t_recv_start = time.perf_counter()
         # Cache pipeline metadata on first call (same for every step).
         if self._cached_server_list is None:
             grpc_metadata = deserialize_metadata(request.grpc_metadata)
@@ -528,8 +519,10 @@ class WorkerNodeService(molink_pb2_grpc.MolinkServiceServicer):
 
         # Parse from combined format (scheduler_output contains everything)
         # or legacy format (intermediate_tensors has per-tensor entries).
+        total_bytes = 0
         if len(request.intermediate_tensors.tensors) == 0:
             # New combined format — parse lazily in background worker
+            total_bytes = len(request.scheduler_output)
             work_item = {
                 "virtual_engine": request.virtual_engine,
                 "combined_data": request.scheduler_output,
@@ -541,6 +534,7 @@ class WorkerNodeService(molink_pb2_grpc.MolinkServiceServicer):
             intermediate_tensors_bytes = {}
             for entry in request.intermediate_tensors.tensors:
                 intermediate_tensors_bytes[entry.key] = entry.tensor_data
+                total_bytes += len(entry.tensor_data)
             work_item = {
                 "virtual_engine": request.virtual_engine,
                 "intermediate_tensors_bytes": intermediate_tensors_bytes,
@@ -549,6 +543,14 @@ class WorkerNodeService(molink_pb2_grpc.MolinkServiceServicer):
                 "step_id": request.step_id,
             }
         await self._work_queue.put(work_item)
+
+        self._record_metric({
+            "type": "tail_recv",
+            "recv_bytes": total_bytes,
+            "grpc_handler_ms": (time.perf_counter() - t_recv_start) * 1000,
+            "virtual_engine": request.virtual_engine,
+            "timestamp": time.time(),
+        })
         return molink_pb2.GrpcResponseData(res=1)
 
     async def PushSamplerOutput(self, request, context):
@@ -811,16 +813,6 @@ class MolinkWorkerNode:
         service._ip = self.ip
         service._grpc_port = self.grpc_port
         service._metrics_enabled = config.enable_metrics
-        if config.enable_metrics:
-            from molinkv1.profiler import init_profiler
-            import os
-            profiler_dir = os.environ.get("MOLINK_PROFILER_DIR", "/tmp/molink_profile")
-            init_profiler(profiler_dir, f"tail_{self.grpc_port}")
-            self._shutdown_event = threading.Event()
-            self._metrics_flush_thread = threading.Thread(
-                target=self._metrics_flush_loop, daemon=True, name="MolinkTailMetricsFlush"
-            )
-            self._metrics_flush_thread.start()
         service.start_background_worker()
         self.service = service
 
@@ -871,12 +863,6 @@ class MolinkWorkerNode:
         from molinkv1.parallel_state import destroy_molink_parallel_state
         destroy_molink_parallel_state()
 
-        if hasattr(self, '_shutdown_event'):
-            self._shutdown_event.set()
-        if hasattr(self, '_metrics_flush_thread') and self._metrics_flush_thread.is_alive():
-            self._flush_metrics_to_file()
-            self._metrics_flush_thread.join(timeout=3)
-
         if self._event_loop and self._event_loop.is_running():
             future = asyncio.run_coroutine_threadsafe(self._async_shutdown(), self._event_loop)
             try:
@@ -914,23 +900,3 @@ class MolinkWorkerNode:
         if hasattr(self, 'service') and self.service is not None:
             self.service.reset_metrics()
 
-    def _flush_metrics_to_file(self):
-        import json
-        import tempfile
-        data = self.get_communication_metrics()
-        path = os.path.join(tempfile.gettempdir(), f"molink_metrics_{self.grpc_port}.json")
-        try:
-            tmp_path = path + ".tmp"
-            with open(tmp_path, "w") as f:
-                json.dump(data, f)
-            os.replace(tmp_path, path)
-        except Exception:
-            pass
-
-    def _metrics_flush_loop(self):
-        while not self._shutdown_event.is_set():
-            self._shutdown_event.wait(timeout=2.0)
-            try:
-                self._flush_metrics_to_file()
-            except Exception:
-                pass

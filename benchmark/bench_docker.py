@@ -2,7 +2,7 @@
 """Docker-based benchmark for MoLink and vLLM pipeline parallelism.
 
 Manages containers with tc/netem network shaping, runs benchmarks,
-and collects metrics.
+and collects logs.
 
 Usage:
     python bench_docker.py                  # MoLink + vLLM
@@ -77,6 +77,9 @@ COOLDOWN = 10
 BENCH_DIR = Path(__file__).parent.resolve()
 BENCHMARK_CLIENT = BENCH_DIR / "benchmark_client.py"
 RESULTS_ROOT = BENCH_DIR / "results"
+
+sys.path.insert(0, str(BENCH_DIR.parent))
+from bench_utils import GPUMonitor, plot_gpu_chart
 
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
@@ -195,7 +198,7 @@ def wait_health(url, timeout=HEALTH_TIMEOUT, container_name=None, log_file=None)
 def _start_molink_node(name, python, pythonpath, grpc_port,
                        start_layer, end_layer, http_port,
                        tp=1, max_batches=MAX_CONCURRENT_BATCHES,
-                       initial_peer=None, metrics=False,
+                       initial_peer=None,
                        molink_enabled=False):
     env = {"PYTHONPATH": pythonpath, "VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS": "3600"}
     cmd = (
@@ -211,8 +214,6 @@ def _start_molink_node(name, python, pythonpath, grpc_port,
     )
     if max_batches:
         cmd += f" --molink-max-concurrent-batches {max_batches}"
-    if metrics:
-        cmd += " --molink-enable-metrics"
     if molink_enabled:
         cmd += " --molink-enabled"
     if initial_peer:
@@ -222,19 +223,18 @@ def _start_molink_node(name, python, pythonpath, grpc_port,
     _dexec(name, cmd + f" &>{log_file}", detach=True, env=env)
 
 
-def start_molink(nodes, tp=1, metrics=True):
+def start_molink(nodes, tp=1):
     pp = len(nodes)
     splits = LAYER_SPLITS[pp]
     for n in nodes:
         _dexec(n["name"],
                f"find {MOLINK_CODE} -name '__pycache__' -type d "
-               f"-exec rm -rf {{}} + 2>/dev/null || true; "
-               f"rm -f /tmp/molink_metrics_*.json 2>/dev/null || true")
+               f"-exec rm -rf {{}} + 2>/dev/null || true")
 
     # Head
     _start_molink_node(nodes[0]["name"], VLLM19_PYTHON, MOLINK_CODE,
                        GRPC_PORTS["head"], *splits[0], HEAD_PORT,
-                       tp=tp, metrics=metrics)
+                       tp=tp)
     if not wait_health(f"http://localhost:{HEAD_PORT}/health",
                        container_name=nodes[0]["name"],
                        log_file="/tmp/bench_head.log"):
@@ -247,8 +247,7 @@ def start_molink(nodes, tp=1, metrics=True):
         _start_molink_node(nodes[1]["name"], VLLM19_PYTHON, MOLINK_CODE,
                            GRPC_PORTS["middle"], *splits[1], MIDDLE_PORT,
                            tp=tp,
-                           initial_peer=f"{nodes[0]['ip']}:{GRPC_PORTS['head']}",
-                           metrics=metrics)
+                           initial_peer=f"{nodes[0]['ip']}:{GRPC_PORTS['head']}")
         if not wait_health(f"http://localhost:{MIDDLE_PORT}/health",
                            container_name=nodes[1]["name"],
                            log_file="/tmp/bench_middle.log"):
@@ -263,8 +262,7 @@ def start_molink(nodes, tp=1, metrics=True):
         prev_ip, prev_grpc = nodes[-2]["ip"], GRPC_PORTS["middle"]
     _start_molink_node(nodes[-1]["name"], VLLM19_PYTHON, MOLINK_CODE,
                        GRPC_PORTS["tail"], *splits[-1], TAIL_PORT,
-                       tp=tp, initial_peer=f"{prev_ip}:{prev_grpc}",
-                       metrics=metrics)
+                       tp=tp, initial_peer=f"{prev_ip}:{prev_grpc}")
     if not wait_health(f"http://localhost:{TAIL_PORT}/health",
                        container_name=nodes[-1]["name"],
                        log_file="/tmp/bench_tail.log"):
@@ -317,31 +315,35 @@ def start_molink_v019(nodes):
 
 # ─── vLLM ────────────────────────────────────────────────────────────────────
 
-def deploy_instrumented_vllm(names):
-    log("Deploying instrumented vLLM...")
-    for n in names:
-        _dexec(n,
-               f"cp {VLLM_SOURCE}/v1/executor/ray_executor.py "
-               f"{VLLM_SITE}/v1/executor/ && "
-               f"cp {VLLM_SOURCE}/v1/executor/ray_utils.py "
-               f"{VLLM_SITE}/v1/executor/ && "
-               f"find {VLLM_SITE} -name '__pycache__' -type d "
-               f"-exec rm -rf {{}} + 2>/dev/null; "
-               f"rm -f /tmp/vllm_metrics.json "
-               f"/tmp/vllm_worker_metrics.json 2>/dev/null || true")
-    log("Instrumented vLLM deployed.")
+def start_vllm_fair(nodes, tp=1):
+    """Start vLLM with NCCL forced through the network stack.
 
-
-def start_vllm(nodes, tp=1):
+    Sets NCCL_P2P_DISABLE=1 so NCCL avoids GPU Direct P2P and uses TCP
+    sockets via eth0, where tc/netem shaping is applied. This makes the
+    PP tensor transfer path comparable to MoLink's gRPC path.
+    """
     pp = len(nodes)
-    deploy_instrumented_vllm([n["name"] for n in nodes])
     cuda_devs = ",".join(str(i) for i in range(tp))
 
+    # NCCL fairness env vars:
+    # - NCCL_P2P_DISABLE=1:  skip GPU Direct, use TCP over eth0
+    # - NCCL_SOCKET_IFNAME=eth0: route through the tc-shaped interface
+    # - NCCL_IB_DISABLE=1:  no RDMA bypass
+    # - VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE=shm: Ray edges use shm
+    # - VLLM_DISABLE_PYNCCL=1:  skip PyNCCL, use stock torch.distributed
+    fair_env = (
+        f"NCCL_P2P_DISABLE=1 "
+        f"NCCL_SOCKET_IFNAME=eth0 "
+        f"NCCL_IB_DISABLE=1 "
+        f"VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE=shm "
+        f"VLLM_DISABLE_PYNCCL=1 "
+        f"CUDA_VISIBLE_DEVICES={cuda_devs} "
+    )
+
     # Ray head
-    log(f"Starting Ray head in {nodes[0]['name']}...")
+    log(f"Starting Ray head (fair) in {nodes[0]['name']}...")
     _dexec(nodes[0]["name"],
-           f"CUDA_VISIBLE_DEVICES={cuda_devs} "
-           f"VLLM_WORKER_METRICS_FILE=/tmp/vllm_worker_metrics.json "
+           f"{fair_env}"
            f"{VLLM19_BIN}/ray start --head "
            f"--node-ip-address={nodes[0]['ip']} "
            f"--port={RAY_PORT} --num-gpus={tp}",
@@ -350,20 +352,18 @@ def start_vllm(nodes, tp=1):
 
     # Ray workers
     for node in nodes[1:]:
-        log(f"Starting Ray worker in {node['name']}...")
+        log(f"Starting Ray worker (fair) in {node['name']}...")
         _dexec(node["name"],
-               f"CUDA_VISIBLE_DEVICES={cuda_devs} "
-               f"VLLM_WORKER_METRICS_FILE=/tmp/vllm_worker_metrics.json "
+               f"{fair_env}"
                f"{VLLM19_BIN}/ray start "
                f"--address={nodes[0]['ip']}:{RAY_PORT} --num-gpus={tp}",
                detach=True)
         time.sleep(8)
 
     # vLLM serve
-    log(f"Starting vLLM serve (PP={pp} TP={tp})...")
+    log(f"Starting vLLM serve (fair, PP={pp} TP={tp})...")
     _dexec(nodes[0]["name"],
-           f"CUDA_VISIBLE_DEVICES={cuda_devs} "
-           f"VLLM_METRICS_FILE=/tmp/vllm_metrics.json "
+           f"{fair_env}"
            f"{VLLM19_BIN}/vllm serve "
            f"--model {MODEL_PATH} "
            f"--port {HEAD_PORT} "
@@ -371,63 +371,34 @@ def start_vllm(nodes, tp=1):
            f"--pipeline-parallel-size {pp} "
            f"--tensor-parallel-size {tp} "
            f"--distributed-executor-backend ray "
-           f"--no-enable-prefix-caching --enforce-eager",
+           f"--no-enable-prefix-caching --enforce-eager "
+           f"&>/tmp/bench_vllm.log",
            detach=True)
     if not wait_health(f"http://localhost:{HEAD_PORT}/health",
                        container_name=nodes[0]["name"],
                        log_file="/tmp/bench_head.log"):
-        die("vLLM failed to start")
+        die("vLLM fair failed to start")
 
 
-# ─── Metrics collection ─────────────────────────────────────────────────────
+# ─── Log collection ──────────────────────────────────────────────────────────
 
-def collect_metrics(system, nodes, outdir):
+def collect_logs(system, nodes, outdir):
     outdir = Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
-    if system == "molink":
-        # Head
-        r = _dexec(nodes[0]["name"],
-                   "cat /tmp/molink_metrics_*.json 2>/dev/null || echo '{}'")
-        (outdir / "head_metrics.json").write_text(r.stdout)
-        # Tail via HTTP
-        r = subprocess.run(
-            ["curl", "-sf", "--noproxy", "localhost",
-             f"http://localhost:{TAIL_PORT}/molink_metrics"],
-            capture_output=True, text=True,
-        )
-        if r.returncode == 0 and r.stdout.strip():
-            (outdir / "tail_metrics.json").write_text(r.stdout)
-        else:
-            r2 = _dexec(nodes[-1]["name"],
-                        "cat /tmp/molink_metrics_*.json 2>/dev/null || echo '{}'")
-            (outdir / "tail_metrics.json").write_text(r2.stdout)
-        # Middle (PP=3)
+    if system in ("molink", "molink011", "molink019"):
+        for node, log_name in [(nodes[0], "head.log"),
+                                (nodes[-1], "tail.log")]:
+            r = _dexec(node["name"], f"cat /tmp/bench_{node['role']}.log 2>/dev/null || true")
+            if r.stdout.strip():
+                (outdir / log_name).write_text(r.stdout)
         if len(nodes) >= 3:
-            r = _dexec(nodes[1]["name"],
-                       "cat /tmp/molink_metrics_*.json 2>/dev/null || echo '{}'")
-            (outdir / "middle_metrics.json").write_text(r.stdout)
-        # HTTP metrics
-        r = subprocess.run(
-            ["curl", "-sf", "--noproxy", "localhost",
-             f"http://localhost:{HEAD_PORT}/molink_metrics"],
-            capture_output=True, text=True,
-        )
-        if r.returncode == 0:
-            (outdir / "molink_http_metrics.json").write_text(r.stdout)
-    elif system == "vllm":
-        r = _dexec(nodes[0]["name"],
-                   "cat /tmp/vllm_metrics.json 2>/dev/null || echo '{}'")
-        (outdir / "vllm_metrics.json").write_text(r.stdout)
-        r = _dexec(nodes[0]["name"],
-                   "cat /tmp/vllm_worker_metrics.json 2>/dev/null || echo '{}'")
-        (outdir / "vllm_worker_head.json").write_text(r.stdout)
-        r = _dexec(nodes[-1]["name"],
-                   "cat /tmp/vllm_worker_metrics.json 2>/dev/null || echo '{}'")
-        (outdir / "vllm_worker_tail.json").write_text(r.stdout)
-        if len(nodes) >= 3:
-            r = _dexec(nodes[1]["name"],
-                       "cat /tmp/vllm_worker_metrics.json 2>/dev/null || echo '{}'")
-            (outdir / "vllm_worker_middle.json").write_text(r.stdout)
+            r = _dexec(nodes[1]["name"], "cat /tmp/bench_middle.log 2>/dev/null || true")
+            if r.stdout.strip():
+                (outdir / "middle.log").write_text(r.stdout)
+    elif system in ("vllm", "vllm_fair"):
+        r = _dexec(nodes[0]["name"], "cat /tmp/bench_vllm.log 2>/dev/null || true")
+        if r.stdout.strip():
+            (outdir / "vllm.log").write_text(r.stdout)
 
 
 # ─── Benchmark runner ────────────────────────────────────────────────────────
@@ -466,10 +437,12 @@ def parse_args():
                     help="Tensor parallel size (default: 1)")
     ap.add_argument("--gpus", default=None,
                     help="GPU devices, e.g. 0,1 or 1,2 (default: auto)")
-    ap.add_argument("--rps", nargs="+", type=float, default=[3],
-                    help="RPS values (default: 3)")
-    ap.add_argument("--network", nargs="+", default=["1gbit,5ms"],
-                    help="Network conditions: bandwidth,latency")
+    ap.add_argument("--rps", nargs="+", type=float, default=[0.5, 1, 3, 5],
+                    help="RPS values (default: 0.5 1 3 5)")
+    ap.add_argument("--network", nargs="+",
+                    default=["1gbit,5ms", "1gbit,10ms", "1gbit,20ms",
+                             "5gbit,10ms", "500mbit,10ms", "none"],
+                    help="Network conditions: bandwidth,latency or 'none' for no limit")
     ap.add_argument("--duration", type=int, default=30,
                     help="Seconds per run (default: 30)")
     ap.add_argument("--output", default=None,
@@ -576,7 +549,10 @@ def main():
                     start_molink(nodes, tp=tp)
                     url = f"http://localhost:{HEAD_PORT}/generate"
                 elif system == "vllm":
-                    start_vllm(nodes, tp=tp)
+                    start_vllm_fair(nodes, tp=tp)
+                    url = f"http://localhost:{HEAD_PORT}/v1/completions"
+                elif system == "vllm_fair":
+                    start_vllm_fair(nodes, tp=tp)
                     url = f"http://localhost:{HEAD_PORT}/v1/completions"
                 elif system == "molink011":
                     start_molink_v011(nodes)
@@ -588,11 +564,19 @@ def main():
                     die(f"Unknown system: {system}")
 
                 # Run benchmarks
+                gpu_indices = sorted(set(g for n in nodes for g in n["gpus"]))
                 for rps in args.rps:
                     outdir = results_dir / system / net_label / f"rps{int(rps)}"
+
+                    gpu_mon = GPUMonitor(interval_s=0.2, gpu_indices=gpu_indices)
+                    gpu_mon.start()
                     run_benchmark(system, url, rps, args.duration, outdir)
-                    if system in ("molink", "vllm"):
-                        collect_metrics(system, nodes, str(outdir))
+                    gpu_data = gpu_mon.save(str(outdir / "gpu_monitor.json"))
+                    plot_gpu_chart(gpu_data, str(outdir / "gpu_chart"),
+                                  title=f"GPU Utilization — {system} {net_label} rps{int(rps)}")
+
+                    if system in ("molink", "vllm", "vllm_fair", "molink011", "molink019"):
+                        collect_logs(system, nodes, str(outdir))
                     log(f"Done: {outdir}/result.json")
                     time.sleep(COOLDOWN)
 

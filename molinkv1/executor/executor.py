@@ -26,7 +26,6 @@ from vllm.logger import init_logger
 from vllm.v1.executor.multiproc_executor import MultiprocExecutor
 from vllm.v1.outputs import ModelRunnerOutput
 
-from molinkv1.profiler import get_profiler
 from molinkv1.service import MolinkService
 from molinkv1.utils import (
     extract_ip,
@@ -204,7 +203,6 @@ class MolinkExecutor(MultiprocExecutor):
         # Event loop for asyncio in separate thread
         self._event_loop: Optional[asyncio.AbstractEventLoop] = None
         self._loop_thread: Optional[threading.Thread] = None
-        self._shutdown_event = threading.Event()
 
         # Thread pool for gRPC calls
         self._executor_pool = ThreadPoolExecutor(max_workers=16)
@@ -224,9 +222,6 @@ class MolinkExecutor(MultiprocExecutor):
         # Each concurrent batch gets a distinct slot so that cross-batch
         # interference cannot happen even under gRPC errors or timeouts.
         self._virtual_engine_counter: int = 0
-
-        # Pipeline step counter for profiling correlation.
-        self._step_id_counter: int = 0
 
         # Initialize parent executor
         super().__init__(vllm_config, monitor_workers=monitor_workers)
@@ -289,15 +284,6 @@ class MolinkExecutor(MultiprocExecutor):
             f"Serving layers: {start_layer}-{end_layer}"
         )
 
-        # Start periodic metrics flush to temp file (read by api_server).
-        if config.enable_metrics:
-            from molinkv1.profiler import init_profiler
-            profiler_dir = os.environ.get("MOLINK_PROFILER_DIR", "/tmp/molink_profile")
-            init_profiler(profiler_dir, f"head_{self.grpc_port}")
-            self._metrics_flush_thread = threading.Thread(
-                target=self._metrics_flush_loop, daemon=True, name="MolinkMetricsFlush"
-            )
-            self._metrics_flush_thread.start()
 
     def _start_event_loop_thread(self) -> None:
         """Start a thread with an event loop for asyncio operations."""
@@ -383,50 +369,27 @@ class MolinkExecutor(MultiprocExecutor):
         grpc_metadata_bytes: bytes,
         virtual_engine: int,
         next_server: str,
-        step_id: int = -1,
-    ) -> dict:
+    ) -> None:
         """Serialize and send intermediate tensors + scheduler_output to the next stage.
 
         All CPU-bound serialization (pickle + tensor copies) runs in a single
         thread-pool call; the gRPC call is awaited to detect failures early.
-
-        Returns timing dict for instrumentation.
         """
-        timings = {}
         loop = asyncio.get_running_loop()
 
         def _prepare_request():
-            t0 = time.perf_counter()
             sched_bytes = pickle.dumps(scheduler_output, pickle.HIGHEST_PROTOCOL)
-            t_pickle = time.perf_counter()
             combined = _serialize_combined(sched_bytes, tensors)
-            t_serialize = time.perf_counter()
-            timings["pickle_ms"] = (t_pickle - t0) * 1000
-            timings["tensor_serialize_ms"] = (t_serialize - t_pickle) * 1000
-            timings["total_serialize_ms"] = (t_serialize - t0) * 1000
-            timings["serialized_bytes"] = len(combined)
             return molink_pb2.GrpcRequestData(
                 scheduler_output=combined,
                 grpc_metadata=grpc_metadata_bytes,
                 virtual_engine=virtual_engine,
-                step_id=step_id,
             )
 
-        t_ser_start = time.perf_counter()
         request = await loop.run_in_executor(self._executor_pool, _prepare_request)
-        t_ser_end = time.perf_counter()
 
-        t_grpc_start = time.perf_counter()
         stub = self._get_stub(next_server)
         await stub.PushIntermediateTensors(request)
-        t_grpc_end = time.perf_counter()
-
-        timings["serialize_wall_ms"] = (t_ser_end - t_ser_start) * 1000
-        timings["grpc_send_ms"] = (t_grpc_end - t_grpc_start) * 1000
-        profiler = get_profiler()
-        if profiler is not None:
-            profiler.record("head_push", timings, step_id=step_id)
-        return timings
 
     def _get_stub(self, address: str) -> molink_pb2_grpc.MolinkServiceStub:
         if address not in self._channel_cache:
@@ -464,15 +427,12 @@ class MolinkExecutor(MultiprocExecutor):
         if self.molink_config.is_head_node and not self._is_molink_last_stage():
             if scheduler_output.total_num_scheduled_tokens > 0:
                 t_start = time.perf_counter()
-                step_id = self._step_id_counter
-                self._step_id_counter += 1
                 # Assign a distinct virtual engine slot to this batch so
                 # concurrent batches do not share the same gRPC queue and
                 # cannot contaminate each other under errors or timeouts.
                 max_ve = self.max_concurrent_batches
                 scheduler_output.virtual_engine = self._virtual_engine_counter
                 self._virtual_engine_counter = (self._virtual_engine_counter + 1) % max_ve
-                scheduler_output._molink_step_id = step_id
                 # Always run head compute synchronously so intermediate
                 # tensors are ready before sample_tokens.
                 result = super().execute_model(scheduler_output, non_block=False)
@@ -494,27 +454,12 @@ class MolinkExecutor(MultiprocExecutor):
                     self._event_loop,
                 )
                 head_compute_ms = (t_after_compute - t_start) * 1000
-                head_total_ms = (time.perf_counter() - t_start) * 1000
                 self.molink_service._record_metric({
                     "type": "head_compute",
-                    "compute_ms": head_total_ms,
+                    "compute_ms": head_compute_ms,
                     "num_tokens": scheduler_output.total_num_scheduled_tokens,
                     "timestamp": time.time(),
                 })
-                profiler = get_profiler()
-                if profiler is not None:
-                    tensor_size_mb = 0
-                    if intermediate is not None:
-                        for t in intermediate.tensors.values():
-                            tensor_size_mb += t.element_size() * t.nelement()
-                        tensor_size_mb /= 1024 * 1024
-                    profiler.record("head_compute", {
-                        "head_compute_ms": head_compute_ms,
-                        "head_total_ms": head_total_ms,
-                        "num_tokens": scheduler_output.total_num_scheduled_tokens,
-                        "tensor_size_mb": round(tensor_size_mb, 2),
-                        "virtual_engine": scheduler_output.virtual_engine,
-                    }, step_id=step_id)
                 # When engine core requested non_block, wrap the result
                 # in an already-resolved Future.
                 if non_block:
@@ -593,7 +538,6 @@ class MolinkExecutor(MultiprocExecutor):
             )
 
         virtual_engine = getattr(scheduler_output, "virtual_engine", 0)
-        step_id = getattr(scheduler_output, "_molink_step_id", -1)
 
         # Get pipeline metadata (cached after first call).
         server_list = self._molink_server_list
@@ -615,22 +559,18 @@ class MolinkExecutor(MultiprocExecutor):
                 None, future.result
             )
 
-        # Serialize and send in one thread-pool call.
+        # Serialize and send.
         loop = asyncio.get_running_loop()
         next_server = server_list[1]
-        t_push_start = time.perf_counter()
-        push_timings = await self._push_intermediate_tensors(
+        await self._push_intermediate_tensors(
             intermediate_tensors.tensors,
             scheduler_output,
             self._molink_grpc_metadata_bytes,
             virtual_engine,
             next_server,
-            step_id=step_id,
         )
-        t_push_end = time.perf_counter()
 
         # Wait for final result from output_queue.
-        t_wait_start = time.perf_counter()
         try:
             output_bytes = await asyncio.wait_for(
                 self.molink_service.output_queue[virtual_engine].get(),
@@ -641,11 +581,8 @@ class MolinkExecutor(MultiprocExecutor):
                 f"[MoLink][VE{virtual_engine}] Timed out after 120s "
                 f"waiting for tail result — tail may have crashed."
             )
-        t_wait_end = time.perf_counter()
 
-        t_deser_start = time.perf_counter()
         result = await loop.run_in_executor(None, pickle.loads, output_bytes)
-        t_deser_end = time.perf_counter()
 
         # Defensive: pad result if it's missing requests the scheduler expects.
         expected = list(scheduler_output.num_scheduled_tokens.keys())
@@ -661,29 +598,6 @@ class MolinkExecutor(MultiprocExecutor):
             result.req_id_to_index = {rid: i for i, rid in enumerate(all_ids)}
             while len(result.sampled_token_ids) < len(all_ids):
                 result.sampled_token_ids.append([0])
-
-        metric = {
-            "type": "head_pipeline",
-            "push_intermediate_ms": (t_push_end - t_push_start) * 1000,
-            "wait_result_ms": (t_wait_end - t_wait_start) * 1000,
-            "deserialize_result_ms": (t_deser_end - t_deser_start) * 1000,
-            "result_bytes": len(output_bytes),
-            "total_pipeline_ms": (time.perf_counter() - t_total_start) * 1000,
-            "virtual_engine": virtual_engine,
-            "num_servers": len(server_list),
-            "timestamp": time.time(),
-        }
-        metric.update(push_timings)
-        self.molink_service._record_metric(metric)
-
-        profiler = get_profiler()
-        if profiler is not None:
-            profiler.record("head_pipeline", {
-                "total_pipeline_ms": metric["total_pipeline_ms"],
-                "wait_result_ms": metric["wait_result_ms"],
-                "deserialize_result_ms": metric["deserialize_result_ms"],
-                "result_bytes": metric["result_bytes"],
-            }, step_id=step_id, virtual_engine=virtual_engine)
 
         return result
 
@@ -743,27 +657,6 @@ class MolinkExecutor(MultiprocExecutor):
     def reset_communication_metrics(self):
         if self.molink_service:
             self.molink_service.reset_metrics()
-
-    def _flush_metrics_to_file(self):
-        import json
-        import tempfile
-        data = self.get_communication_metrics()
-        path = os.path.join(tempfile.gettempdir(), f"molink_metrics_{self.grpc_port}.json")
-        try:
-            tmp_path = path + ".tmp"
-            with open(tmp_path, "w") as f:
-                json.dump(data, f)
-            os.replace(tmp_path, path)
-        except Exception:
-            pass
-
-    def _metrics_flush_loop(self):
-        while not self._shutdown_event.is_set():
-            self._shutdown_event.wait(timeout=2.0)
-            try:
-                self._flush_metrics_to_file()
-            except Exception:
-                pass
 
     async def _async_shutdown(self) -> None:
         if self.grpc_server:

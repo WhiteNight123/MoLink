@@ -3,17 +3,15 @@ MoLink gRPC service implementation for cross-node pipeline parallelism.
 """
 
 import asyncio
-import io
-import struct
+import struct as _struct
 import threading
 import time
 import traceback
 from collections import deque
-from typing import TYPE_CHECKING, Dict
-import numpy as np
-import torch
+from typing import TYPE_CHECKING
+
 from vllm.logger import init_logger
-from vllm.sequence import IntermediateTensors
+
 from molinkv1.comm import molink_pb2, molink_pb2_grpc
 from molinkv1.utils import PipelineTopology, deserialize_metadata
 
@@ -110,7 +108,6 @@ class MolinkService(molink_pb2_grpc.MolinkServiceServicer):
             )
 
             # Send head node's num_gpu_blocks so the worker can cap its own.
-            import struct as _struct
             head_num_blocks = getattr(
                 self.executor.vllm_config.cache_config, "num_gpu_blocks", 0
             )
@@ -213,101 +210,6 @@ class MolinkService(molink_pb2_grpc.MolinkServiceServicer):
 
         except Exception as e:
             logger.error(f"[MoLink][SERVICE] Error in PushSamplerOutput: {e}")
-            traceback.print_exc()
-            return molink_pb2.GrpcResponseData(res=0, error_message=str(e))
-
-    async def ExecuteWorkerStep(
-        self, request: molink_pb2.GrpcTriggerRequest, context
-    ) -> molink_pb2.GrpcResponseData:
-        """Execute a forward step on this worker node."""
-        try:
-            virtual_engine = request.virtual_engine
-
-            try:
-                scheduler_output_bytes, intermediate_tensors_bytes, grpc_metadata = (
-                    await asyncio.wait_for(
-                        self.input_queue[virtual_engine].get(), timeout=10.0
-                    )
-                )
-            except asyncio.TimeoutError:
-                logger.error(
-                    f"[MoLink][VE{virtual_engine}][WORKER] TIMEOUT waiting for input queue! "
-                    f"Queue size: {self.input_queue[virtual_engine].qsize()}"
-                )
-                raise
-
-            def deserialize_tensors(
-                tensor_bytes: Dict[str, bytes],
-            ) -> IntermediateTensors:
-                tensors = {}
-                for key, data in tensor_bytes.items():
-                    # Parse header: [ndim(4B)][shape(ndim*8B)][dtype_len(4B)][dtype_str][raw]
-                    offset = 0
-                    (ndim,) = struct.unpack_from("<I", data, offset)
-                    offset += 4
-                    shape = []
-                    for _ in range(ndim):
-                        (dim,) = struct.unpack_from("<Q", data, offset)
-                        shape.append(dim)
-                        offset += 8
-                    (dtype_len,) = struct.unpack_from("<I", data, offset)
-                    offset += 4
-                    dtype_name = data[offset : offset + dtype_len].decode("ascii")
-                    offset += dtype_len
-                    raw = data[offset:]
-                    if dtype_name == "torch.bfloat16":
-                        # raw bytes are uint8 view of bfloat16 data
-                        n_elements = 1
-                        for d in shape:
-                            n_elements *= d
-                        tensor = torch.frombuffer(
-                            raw, dtype=torch.uint8
-                        ).reshape(n_elements, 2).view(torch.bfloat16).reshape(
-                            tuple(shape)
-                        ).to("cuda")
-                    else:
-                        np_array = np.frombuffer(
-                            raw, dtype=np.dtype(dtype_name.replace("torch.", ""))
-                        ).reshape(tuple(shape))
-                        tensor = torch.from_numpy(np_array).to("cuda")
-                    tensors[key] = tensor
-                return IntermediateTensors(tensors=tensors)
-
-            t_deser_start = time.perf_counter()
-            intermediate_tensors = await asyncio.to_thread(
-                deserialize_tensors, intermediate_tensors_bytes
-            )
-            t_deser_end = time.perf_counter()
-            deserialize_ms = (t_deser_end - t_deser_start) * 1000
-
-            t_compute_start = time.perf_counter()
-            result = await self.executor.execute_worker_step(
-                scheduler_output_bytes,
-                intermediate_tensors,
-                grpc_metadata,
-                virtual_engine,
-            )
-            t_compute_end = time.perf_counter()
-            compute_ms = (t_compute_end - t_compute_start) * 1000
-
-            # result is (output_bytes, virtual_engine) if last stage, else (None, virtual_engine)
-            output_bytes, ve = result if isinstance(result, tuple) else (None, virtual_engine)
-
-            self._record_metric({
-                "type": "worker_step",
-                "deserialize_ms": deserialize_ms,
-                "compute_ms": compute_ms,
-                "timestamp": time.time(),
-            })
-
-            return molink_pb2.GrpcResponseData(
-                res=1,
-                output_data=output_bytes or b'',
-                virtual_engine=ve,
-            )
-
-        except Exception as e:
-            logger.error(f"[MoLink][WORKER] Error in ExecuteWorkerStep: {e}")
             traceback.print_exc()
             return molink_pb2.GrpcResponseData(res=0, error_message=str(e))
 
