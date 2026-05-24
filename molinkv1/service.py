@@ -198,6 +198,7 @@ class MolinkService(molink_pb2_grpc.MolinkServiceServicer):
             virtual_engine = request.virtual_engine
             output_bytes = request.output_data
 
+            print(f"{virtual_engine} 0 back to head at {time.time()}", flush=True)
             await self.output_queue[virtual_engine].put(output_bytes)
 
             self._record_metric({

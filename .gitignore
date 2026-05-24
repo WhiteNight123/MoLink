@@ -4,6 +4,7 @@ benchmark/results_distributed
 benchmark/results_profile
 benchmark/results_compare
 benchmark/final_report
+benchmark/results_batch
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

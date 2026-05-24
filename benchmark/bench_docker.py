@@ -107,12 +107,20 @@ def _dexec(name, cmd, detach=False, env=None):
 
 
 def ensure_network():
+    # Overlay networks require Swarm mode
+    r = subprocess.run(["docker", "info", "--format", "{{.Swarm.LocalNodeState}}"],
+                       capture_output=True, text=True)
+    if r.stdout.strip() != "active":
+        log("Initializing Docker Swarm for overlay network...")
+        subprocess.run(["docker", "swarm", "init"], check=True)
+
     r = subprocess.run(["docker", "network", "inspect", DOCKER_NETWORK],
                        capture_output=True, text=True)
     if r.returncode != 0:
-        log(f"Creating Docker network: {DOCKER_NETWORK}")
+        log(f"Creating Docker overlay network: {DOCKER_NETWORK}")
         subprocess.run(
-            ["docker", "network", "create", "--subnet", SUBNET, DOCKER_NETWORK],
+            ["docker", "network", "create", "--driver", "overlay",
+             "--attachable", "--subnet", SUBNET, DOCKER_NETWORK],
             check=True,
         )
 
@@ -316,10 +324,10 @@ def start_molink_v019(nodes):
 # ─── vLLM ────────────────────────────────────────────────────────────────────
 
 def start_vllm_fair(nodes, tp=1):
-    """Start vLLM with NCCL forced through the network stack.
+    """Start vLLM with NCCL forced through the overlay network stack.
 
     Sets NCCL_P2P_DISABLE=1 so NCCL avoids GPU Direct P2P and uses TCP
-    sockets via eth0, where tc/netem shaping is applied. This makes the
+    sockets via eth0 (overlay), where tc/netem shaping is applied. This makes the
     PP tensor transfer path comparable to MoLink's gRPC path.
     """
     pp = len(nodes)
@@ -327,7 +335,7 @@ def start_vllm_fair(nodes, tp=1):
 
     # NCCL fairness env vars:
     # - NCCL_P2P_DISABLE=1:  skip GPU Direct, use TCP over eth0
-    # - NCCL_SOCKET_IFNAME=eth0: route through the tc-shaped interface
+    # - NCCL_SOCKET_IFNAME=eth0: route through the tc-shaped overlay interface
     # - NCCL_IB_DISABLE=1:  no RDMA bypass
     # - VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE=shm: Ray edges use shm
     # - VLLM_DISABLE_PYNCCL=1:  skip PyNCCL, use stock torch.distributed
@@ -344,6 +352,7 @@ def start_vllm_fair(nodes, tp=1):
     log(f"Starting Ray head (fair) in {nodes[0]['name']}...")
     _dexec(nodes[0]["name"],
            f"{fair_env}"
+           f"VLLM_HOST_IP={nodes[0]['ip']} "
            f"{VLLM19_BIN}/ray start --head "
            f"--node-ip-address={nodes[0]['ip']} "
            f"--port={RAY_PORT} --num-gpus={tp}",
@@ -355,6 +364,7 @@ def start_vllm_fair(nodes, tp=1):
         log(f"Starting Ray worker (fair) in {node['name']}...")
         _dexec(node["name"],
                f"{fair_env}"
+               f"VLLM_HOST_IP={node['ip']} "
                f"{VLLM19_BIN}/ray start "
                f"--address={nodes[0]['ip']}:{RAY_PORT} --num-gpus={tp}",
                detach=True)
@@ -364,6 +374,7 @@ def start_vllm_fair(nodes, tp=1):
     log(f"Starting vLLM serve (fair, PP={pp} TP={tp})...")
     _dexec(nodes[0]["name"],
            f"{fair_env}"
+           f"VLLM_HOST_IP={nodes[0]['ip']} "
            f"{VLLM19_BIN}/vllm serve "
            f"--model {MODEL_PATH} "
            f"--port {HEAD_PORT} "
@@ -437,11 +448,10 @@ def parse_args():
                     help="Tensor parallel size (default: 1)")
     ap.add_argument("--gpus", default=None,
                     help="GPU devices, e.g. 0,1 or 1,2 (default: auto)")
-    ap.add_argument("--rps", nargs="+", type=float, default=[0.5, 1, 3, 5],
+    ap.add_argument("--rps", nargs="+", type=float, default=[3],
                     help="RPS values (default: 0.5 1 3 5)")
     ap.add_argument("--network", nargs="+",
-                    default=["1gbit,5ms", "1gbit,10ms", "1gbit,20ms",
-                             "5gbit,10ms", "500mbit,10ms", "none"],
+                    default=["1gbit,1ms"],
                     help="Network conditions: bandwidth,latency or 'none' for no limit")
     ap.add_argument("--duration", type=int, default=30,
                     help="Seconds per run (default: 30)")

@@ -402,6 +402,11 @@ class WorkerNodeService(molink_pb2_grpc.MolinkServiceServicer):
         queue_wait_ms = (t_total_start - enqueue_time) * 1000 if enqueue_time else 0
 
         # GPU compute (serialized — model runner is not concurrent-safe).
+        num_tokens = scheduler_output.total_num_scheduled_tokens
+        num_reqs = len(scheduler_output.num_scheduled_tokens)
+        has_new = bool(getattr(scheduler_output, 'scheduled_new_reqs', None))
+        stage = "prefill" if has_new else "decode"
+        print(f"{virtual_engine} {num_reqs} compute starts ({stage}) at {time.time()}", flush=True)
         t_compute_start = time.perf_counter()
         compute_lock_wait_ms = 0
         try:
@@ -421,6 +426,7 @@ class WorkerNodeService(molink_pb2_grpc.MolinkServiceServicer):
             if output is None:
                 raise
         t_compute_end = time.perf_counter()
+        print(f"{virtual_engine} {num_reqs} compute ends ({stage}) at {time.time()}", flush=True)
 
         # Route result.
         server_list = self._cached_server_list
@@ -437,6 +443,7 @@ class WorkerNodeService(molink_pb2_grpc.MolinkServiceServicer):
         t_grpc_send_ms = 0
         output_bytes = b""
         if is_last_stage:
+            print(f"{virtual_engine} {num_reqs} trans starts at {time.time()}", flush=True)
             t_ser_start = time.perf_counter()
             output_bytes = await loop.run_in_executor(
                 None, pickle.dumps, output, pickle.HIGHEST_PROTOCOL,
@@ -543,6 +550,9 @@ class WorkerNodeService(molink_pb2_grpc.MolinkServiceServicer):
                 "step_id": request.step_id,
             }
         await self._work_queue.put(work_item)
+
+        ve = request.virtual_engine
+        print(f"{ve} 0 recv at {time.time()}", flush=True)
 
         self._record_metric({
             "type": "tail_recv",

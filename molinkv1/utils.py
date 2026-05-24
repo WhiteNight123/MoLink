@@ -58,13 +58,15 @@ def get_grpc_options(max_message_size_mb: int = 200) -> List[Tuple[str, int]]:
         List of gRPC options tuples.
     """
     max_size = max_message_size_mb * 1024 * 1024
-    flow_control_window = 16 * 1024 * 1024
+    window = 16 * 1024 * 1024  # 16 MB
     return [
         ("grpc.max_send_message_length", max_size),
         ("grpc.max_receive_message_length", max_size),
-        ("grpc.http2.lookahead_bytes", flow_control_window),
-        ("grpc.http2.write_buffer_size", flow_control_window),
-        ("grpc.http2.bdp_probe", 1),
+        ("grpc.http2.initial_window_size", window),
+        ("grpc.http2.max_frame_size", 4 * 1024 * 1024),
+        ("grpc.http2.lookahead_bytes", window),
+        ("grpc.http2.write_buffer_size", window),
+        ("grpc.http2.bdp_probe", 0),
         ("grpc.optimization_target", "throughput"),
         ("grpc.keepalive_time_ms", 30000),
         ("grpc.keepalive_timeout_ms", 10000),
