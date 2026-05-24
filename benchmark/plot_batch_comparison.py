@@ -5,8 +5,7 @@ Combines head and tail logs to produce a single timeline visualization
 showing compute bars, network transfers, and request events.
 
 Usage:
-    python plot_batch_comparison.py --system molink --logdir results/molink/logs
-    python plot_batch_comparison.py --system vllm --logdir results/vllm/logs
+    python plot_batch_comparison.py  --logdir results_batch/20260524_163412
 """
 
 import argparse
@@ -19,7 +18,6 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib as mpl
-import numpy as np
 from matplotlib.patches import FancyArrowPatch, Rectangle
 
 # ── Style ──────────────────────────────────────────────────────────────────
@@ -229,19 +227,33 @@ def draw_transfers(s1_events, s2_events, ax, norm_start, norm_end, base_time):
                         bbox=dict(facecolor="white", alpha=0.8, edgecolor="gray", boxstyle="round,pad=0.2"))
 
 
-def draw_request_events(request_events_dict, ax, norm_start, norm_end, base_time):
-    request_counts = defaultdict(lambda: defaultdict(int))
+def _merge_events(request_events_dict, base_time, merge_window=0.1):
+    """Merge per-request events whose timestamps fall within *merge_window* seconds."""
+    # Collect all (norm_ts, event_type) pairs
+    raw = []
     for ts, evts in request_events_dict.items():
         for ev in evts:
             etype = ev[0]
             if etype.endswith("_count"):
                 action = etype.replace("_count", "")
-                request_counts[ts][action] += int(ev[1])
+                raw.append((ts - base_time, action, int(ev[1])))
             else:
-                request_counts[ts][ev[0]] += 1
+                raw.append((ts - base_time, ev[0], 1))
+    raw.sort()
 
-    for ts, event_counts in request_counts.items():
-        norm_ts = ts - base_time
+    merged = defaultdict(lambda: defaultdict(int))  # norm_ts -> {type: count}
+    bucket_ts = None
+    for norm_ts, etype, count in raw:
+        if bucket_ts is None or norm_ts - bucket_ts > merge_window:
+            bucket_ts = norm_ts
+        merged[bucket_ts][etype] += count
+    return merged
+
+
+def draw_request_events(request_events_dict, ax, norm_start, norm_end, base_time):
+    merged = _merge_events(request_events_dict, base_time)
+
+    for norm_ts, event_counts in merged.items():
         if not (norm_start <= norm_ts <= norm_end):
             continue
         for event_type, count in event_counts.items():
@@ -259,7 +271,7 @@ def draw_request_events(request_events_dict, ax, norm_start, norm_end, base_time
 
 # ── Main plotting ──────────────────────────────────────────────────────────
 
-def plot_timeline(s1_events, s2_events, request_events_dict, output_path, title, system):
+def plot_timeline(s1_events, s2_events, request_events_dict, output_path, title, time_range=None):
     all_ts = []
     for evts in [s1_events, s2_events]:
         for batch_evts in evts.values():
@@ -279,12 +291,15 @@ def plot_timeline(s1_events, s2_events, request_events_dict, output_path, title,
     ax.set_facecolor("#FFFFFF")
 
     # Determine time range
-    all_norm = [t - base_time for t in all_ts]
-    norm_start = min(all_norm)
-    norm_end = max(all_norm)
-    margin = (norm_end - norm_start) * 0.05
-    norm_start -= margin
-    norm_end += margin
+    if time_range is not None:
+        norm_start, norm_end = time_range
+    else:
+        all_norm = [t - base_time for t in all_ts]
+        norm_start = min(all_norm)
+        norm_end = max(all_norm)
+        margin = (norm_end - norm_start) * 0.05
+        norm_start -= margin
+        norm_end += margin
 
     # Draw
     draw_compute_segments(s1_events, RESOURCE_LEVELS["Server1 Compute"], ax, norm_start, norm_end, base_time, is_top=True)
@@ -320,60 +335,99 @@ def plot_timeline(s1_events, s2_events, request_events_dict, output_path, title,
     plt.close(fig)
 
 
-def main():
-    ap = argparse.ArgumentParser(description="Plot batch-level timeline")
-    ap.add_argument("--system", required=True, choices=["molink", "vllm"])
-    ap.add_argument("--logdir", required=True, help="Directory with head.log, tail.log or vllm.log")
-    ap.add_argument("--output", required=True, help="Output path prefix for plots")
-    args = ap.parse_args()
+def _plot_molink(logdir, outdir, time_range):
+    head_log = logdir / "head.log"
+    tail_log = logdir / "tail.log"
+    if not head_log.exists() or not tail_log.exists():
+        print(f"ERROR: Missing log files in {logdir}", file=sys.stderr)
+        return
 
-    logdir = Path(args.logdir)
-    outdir = Path(args.output)
-    outdir.mkdir(parents=True, exist_ok=True)
+    print(f"Parsing head log: {head_log}")
+    s1_events, _ = parse_log_file(str(head_log))
+    print(f"Parsing tail log: {tail_log}")
+    s2_events, _ = parse_log_file(str(tail_log))
 
-    if args.system == "molink":
-        head_log = logdir / "head.log"
-        tail_log = logdir / "tail.log"
-        if not head_log.exists() or not tail_log.exists():
-            print(f"ERROR: Missing log files in {logdir}", file=sys.stderr)
-            sys.exit(1)
+    request_events = defaultdict(list)
+    _, req1 = parse_log_file(str(head_log))
+    for ts, evts in req1.items():
+        request_events[ts].extend(evts)
 
-        print(f"Parsing head log: {head_log}")
-        s1_events, _ = parse_log_file(str(head_log))
-        print(f"Parsing tail log: {tail_log}")
-        s2_events, _ = parse_log_file(str(tail_log))
+    title = "MoLink Pipeline Parallelism — Batch-Level Timeline"
+    if time_range:
+        title += f" (t={time_range[0]:.1f}s–{time_range[1]:.1f}s)"
+    plot_timeline(s1_events, s2_events, request_events, str(outdir / "molink_timeline"), title, time_range)
 
-        # Combine request events from both
-        request_events = defaultdict(list)
-        _, req1 = parse_log_file(str(head_log))
-        for ts, evts in req1.items():
+
+def _plot_vllm(logdir, outdir, time_range):
+    head_log = logdir / "head.log"
+    tail_log = logdir / "tail.log"
+    if not head_log.exists() or not tail_log.exists():
+        print(f"ERROR: Missing head.log or tail.log in {logdir}", file=sys.stderr)
+        return
+
+    print(f"Parsing vLLM head log: {head_log}")
+    s1_events, _ = parse_log_file(str(head_log))
+    print(f"Parsing vLLM tail log: {tail_log}")
+    s2_events, _ = parse_log_file(str(tail_log))
+
+    request_events = defaultdict(list)
+    vllm_log = logdir / "vllm.log"
+    if vllm_log.exists():
+        _, req_events = parse_log_file(str(vllm_log))
+        for ts, evts in req_events.items():
             request_events[ts].extend(evts)
 
-        title = "MoLink Pipeline Parallelism — Batch-Level Timeline"
-        plot_timeline(s1_events, s2_events, request_events, str(outdir / "molink_timeline"), title, "molink")
+    title = "vLLM Pipeline Parallelism — Batch-Level Timeline"
+    if time_range:
+        title += f" (t={time_range[0]:.1f}s–{time_range[1]:.1f}s)"
+    plot_timeline(s1_events, s2_events, request_events, str(outdir / "vllm_timeline"), title, time_range)
 
-    elif args.system == "vllm":
-        head_log = logdir / "head.log"
-        tail_log = logdir / "tail.log"
-        if not head_log.exists() or not tail_log.exists():
-            print(f"ERROR: Missing head.log or tail.log in {logdir}", file=sys.stderr)
+
+_SYSTEM_HANDLERS = {
+    "molink": _plot_molink,
+    "vllm": _plot_vllm,
+}
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Plot batch-level timeline")
+    ap.add_argument("--system", choices=["molink", "vllm"],
+                    help="Plot a specific system. If omitted, auto-detects molink/ and vllm/ subdirectories.")
+    ap.add_argument("--logdir", required=True,
+                    help="Results directory. Either contains head.log/tail.log directly, "
+                         "or has molink/ and vllm/ subdirectories with logs/ inside.")
+    ap.add_argument("--output",
+                    help="Output directory for plots. Defaults to --logdir/plots.")
+    ap.add_argument("--time-range", default=None,
+                    help="Plot time window in seconds from start, e.g. '1-3' plots 1s to 3s")
+    args = ap.parse_args()
+
+    time_range = None
+    if args.time_range:
+        parts = args.time_range.split("-", 1)
+        time_range = (float(parts[0]), float(parts[1]))
+
+    logdir = Path(args.logdir).resolve()
+
+    if args.system:
+        # Explicit single-system mode: logdir points at the log directory directly
+        outdir = Path(args.output) if args.output else logdir / "plots"
+        outdir.mkdir(parents=True, exist_ok=True)
+        _SYSTEM_HANDLERS[args.system](logdir, outdir, time_range)
+    else:
+        # Auto-detect mode: logdir contains molink/ and/or vllm/ subdirectories
+        outdir = Path(args.output) if args.output else logdir / "plots"
+        outdir.mkdir(parents=True, exist_ok=True)
+        found = False
+        for name, handler in _SYSTEM_HANDLERS.items():
+            sys_logdir = logdir / name / "logs"
+            if sys_logdir.is_dir():
+                print(f"\n=== Detected {name} logs at {sys_logdir} ===")
+                handler(sys_logdir, outdir, time_range)
+                found = True
+        if not found:
+            print(f"ERROR: No molink/logs/ or vllm/logs/ found under {logdir}", file=sys.stderr)
             sys.exit(1)
-
-        print(f"Parsing vLLM head log: {head_log}")
-        s1_events, _ = parse_log_file(str(head_log))
-        print(f"Parsing vLLM tail log: {tail_log}")
-        s2_events, _ = parse_log_file(str(tail_log))
-
-        # Request events come from the main serve output (vllm.log)
-        request_events = defaultdict(list)
-        vllm_log = logdir / "vllm.log"
-        if vllm_log.exists():
-            _, req_events = parse_log_file(str(vllm_log))
-            for ts, evts in req_events.items():
-                request_events[ts].extend(evts)
-
-        title = "vLLM Pipeline Parallelism — Batch-Level Timeline"
-        plot_timeline(s1_events, s2_events, request_events, str(outdir / "vllm_timeline"), title, "vllm")
 
 
 if __name__ == "__main__":
