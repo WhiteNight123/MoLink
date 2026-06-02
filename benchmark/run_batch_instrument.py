@@ -47,8 +47,10 @@ PORT_MAP = {"head": HEAD_PORT, "tail": TAIL_PORT}
 
 INPUT_TOKENS = 256
 OUTPUT_TOKENS = 8
+BENCH_RPS = 3
+BENCH_DURATION = 10
 MAX_MODEL_LEN = 4096
-MOLINK_MAX_CONCURRENT_BATCHES = 1
+MOLINK_MAX_CONCURRENT_BATCHES = 2
 HEALTH_TIMEOUT = 300
 COOLDOWN = 5
 
@@ -67,6 +69,7 @@ LOCAL_VLLM_SRC = str(Path(__file__).resolve().parent.parent.parent / "vllm" / "v
 REMOTE_VLLM_SITE = "/home/gpu2/miniconda3/envs/vllm19/lib/python3.12/site-packages/vllm"
 _VLLM_INSTRUMENTED = [
     "v1/executor/ray_utils.py",
+    "v1/executor/ray_executor.py",
     "v1/worker/gpu_worker.py",
     "v1/engine/core.py",
     "entrypoints/openai/completion/serving.py",
@@ -269,6 +272,8 @@ def start_vllm(nodes):
         r = _dexec(node["name"],
                    f"cp {VLLM_SOURCE}/v1/executor/ray_utils.py {VLLM_SITE}/v1/executor/ray_utils.py && "
                    f"rm -f {VLLM_SITE}/v1/executor/__pycache__/ray_utils.cpython*.pyc && "
+                   f"cp {VLLM_SOURCE}/v1/executor/ray_executor.py {VLLM_SITE}/v1/executor/ray_executor.py && "
+                   f"rm -f {VLLM_SITE}/v1/executor/__pycache__/ray_executor.cpython*.pyc && "
                    f"cp {VLLM_SOURCE}/v1/worker/gpu_worker.py {VLLM_SITE}/v1/worker/gpu_worker.py && "
                    f"rm -f {VLLM_SITE}/v1/worker/__pycache__/gpu_worker.cpython*.pyc && "
                    f"cp {VLLM_SOURCE}/v1/engine/core.py {VLLM_SITE}/v1/engine/core.py && "
@@ -332,7 +337,7 @@ def collect_logs(system, nodes, outdir):
 
 # ── Benchmark runner ────────────────────────────────────────────────────────
 
-def run_benchmark(system, url, outdir, model=None, tokenizer=None):
+def run_benchmark(system, url, outdir, model=None, tokenizer=None, rps=BENCH_RPS, duration=BENCH_DURATION):
     outdir = Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
     log(f"--- [{system}] running benchmark ---")
@@ -342,8 +347,8 @@ def run_benchmark(system, url, outdir, model=None, tokenizer=None):
         "--type", "molink" if system == "molink" else "vllm",
         "--input-tokens", str(INPUT_TOKENS),
         "--output-tokens", str(OUTPUT_TOKENS),
-        "--rps", "1",
-        "--duration", "1",
+        "--rps", str(rps),
+        "--duration", str(duration),
         "--model", model or MODEL_PATH,
         "--tokenizer", tokenizer or HOST_TOKENIZER,
         "--output", str(outdir / "result.json"),
@@ -616,6 +621,10 @@ def parse_args():
     ap.add_argument("--remote-gpu", default="0", help="Remote GPU device (distributed mode)")
     ap.add_argument("--network", default="1gbit,10ms",
                     help="Network condition: bandwidth,latency or 'none' (Docker mode)")
+    ap.add_argument("--rps", type=int, default=BENCH_RPS,
+                    help=f"Requests per second (default: {BENCH_RPS})")
+    ap.add_argument("--duration", type=int, default=BENCH_DURATION,
+                    help=f"Benchmark duration in seconds (default: {BENCH_DURATION})")
     ap.add_argument("--molink-max-concurrent-batches", type=int,
                     default=MOLINK_MAX_CONCURRENT_BATCHES,
                     help=f"MoLink max concurrent batches (default: {MOLINK_MAX_CONCURRENT_BATCHES})")
@@ -710,7 +719,7 @@ def main_docker(args, systems):
             system_dir = results_dir / system
             log_dir = system_dir / "logs"
             plot_dir = system_dir / "plots"
-            run_benchmark(system, url, system_dir)
+            run_benchmark(system, url, system_dir, rps=args.rps, duration=args.duration)
             collect_logs(system, nodes, log_dir)
             generate_plot(system, log_dir, plot_dir)
 
@@ -778,7 +787,7 @@ def main_distributed(args, systems):
             else:
                 die(f"Unknown system: {system}")
 
-            run_benchmark(system, url, system_dir, model=model, tokenizer=tokenizer)
+            run_benchmark(system, url, system_dir, model=model, tokenizer=tokenizer, rps=args.rps, duration=args.duration)
             collect_logs_distributed(system, log_dir)
             generate_plot(system, log_dir, plot_dir)
 

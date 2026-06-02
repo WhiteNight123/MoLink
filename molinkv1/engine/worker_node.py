@@ -278,9 +278,6 @@ class WorkerNodeService(molink_pb2_grpc.MolinkServiceServicer):
         self._metrics_deque = collections.deque(maxlen=2000)
         self._metrics_enabled = False
 
-        # Serialize GPU compute (model runner is not concurrent-safe).
-        self._compute_lock = asyncio.Lock()
-
         # Async work queue: PushIntermediateTensors enqueues here and returns
         # immediately so the head's gRPC call is not blocked by tail compute.
         self._work_queue: asyncio.Queue = asyncio.Queue()
@@ -310,17 +307,35 @@ class WorkerNodeService(molink_pb2_grpc.MolinkServiceServicer):
             self._worker_task = asyncio.create_task(self._process_work_queue())
 
     async def _process_work_queue(self):
-        """Process items from the work queue, overlapping CPU deser with GPU compute.
+        """Process items from the work queue with overlapped phases.
 
-        Instead of processing each item sequentially (deser → compute → push),
-        we pre-fetch and deserialize item N+1 while item N is computing on GPU.
-        This hides CPU-bound deserialization latency behind GPU compute time.
+        Pipeline within the tail node:
+          [deser N] → [GPU compute N] → [push N (background)]
+                                          [deser N+1] → [GPU compute N+1] → ...
+        Output push (CPU serialize + gRPC) of batch N overlaps with
+        deserialization + GPU compute of batch N+1.
+
+        Per-VE push tracking ensures same-VE ordering: a VE's previous push
+        is awaited only when that VE is used again, so pushes for different
+        VEs can run concurrently with GPU compute for other VEs.
         """
         work_item = await self._work_queue.get()
         pending_deser: Optional[asyncio.Task] = None
+        ve_pushes: dict[int, asyncio.Task] = {}
 
         while True:
-            ve = work_item.get("virtual_engine", "?")
+            ve = work_item.get("virtual_engine", 0)
+
+            # Wait for this VE's previous push (if any) to preserve ordering.
+            prev_push = ve_pushes.pop(ve, None)
+            if prev_push is not None:
+                try:
+                    await prev_push
+                except Exception as e:
+                    logger.error(
+                        "[MoLink][TAIL] Output push failed for VE %s: %s", ve, e
+                    )
+                    traceback.print_exc()
 
             # Deserialize current item (or await pre-deserialized result).
             try:
@@ -347,14 +362,25 @@ class WorkerNodeService(molink_pb2_grpc.MolinkServiceServicer):
             except asyncio.QueueEmpty:
                 pending_deser = None
 
-            # GPU compute + gRPC push (next item deserializes in background).
+            # GPU compute — runs immediately, no global lock.
             try:
-                await self._compute_and_push(deserialized)
+                output, scheduler_output, work_item_data = (
+                    await self._run_compute(deserialized)
+                )
             except Exception as e:
                 logger.error(
                     "[MoLink][TAIL] Compute failed for VE %s: %s", ve, e
                 )
                 traceback.print_exc()
+                if pending_deser is None:
+                    work_item = await self._work_queue.get()
+                continue
+
+            # Start output push in background — overlaps with next iterations.
+            # The push for this VE will be awaited when this VE is used next.
+            ve_pushes[ve] = asyncio.create_task(
+                self._push_result(output, scheduler_output, work_item_data)
+            )
 
             if pending_deser is None:
                 work_item = await self._work_queue.get()
@@ -397,18 +423,19 @@ class WorkerNodeService(molink_pb2_grpc.MolinkServiceServicer):
             intermediate_tensors, scheduler_output, work_item, recv_bytes, deser_ms,
         )
 
-    async def _compute_and_push(self, deserialized):
-        """GPU compute + result serialization + gRPC push."""
+    async def _run_compute(self, deserialized):
+        """GPU compute only (no lock — single consumer guarantees serial access).
+
+        Returns (output, scheduler_output, work_item_data) for the push phase.
+        """
         intermediate_tensors, scheduler_output, work_item, recv_bytes, deser_ms = deserialized
-        t_total_start = time.perf_counter()
+        t_start = time.perf_counter()
         virtual_engine = work_item["virtual_engine"]
-        step_id = work_item.get("step_id", -1)
         loop = asyncio.get_running_loop()
 
-        enqueue_time = work_item.get("enqueue_time", t_total_start)
-        queue_wait_ms = (t_total_start - enqueue_time) * 1000 if enqueue_time else 0
+        enqueue_time = work_item.get("enqueue_time", t_start)
+        queue_wait_ms = (t_start - enqueue_time) * 1000 if enqueue_time else 0
 
-        # GPU compute (serialized — model runner is not concurrent-safe).
         num_tokens = scheduler_output.total_num_scheduled_tokens
         num_reqs = len(scheduler_output.num_scheduled_tokens)
         prefill_count = len(getattr(scheduler_output, 'scheduled_new_reqs', []) or [])
@@ -417,12 +444,8 @@ class WorkerNodeService(molink_pb2_grpc.MolinkServiceServicer):
         stage = "prefill" if has_new else "decode"
         _log_molink_event(f"{virtual_engine} {prefill_count}P{decode_count}D compute starts ({stage}) at {time.time()}")
         t_compute_start = time.perf_counter()
-        compute_lock_wait_ms = 0
         try:
-            t_lock_acquire = time.perf_counter()
-            async with self._compute_lock:
-                compute_lock_wait_ms = (time.perf_counter() - t_lock_acquire) * 1000
-                output = await self._run_step(scheduler_output, intermediate_tensors)
+            output = await self._run_step(scheduler_output, intermediate_tensors)
         except Exception as e:
             logger.warning(
                 "[MoLink][TAIL] _run_step failed (VE %s): %s. "
@@ -437,7 +460,27 @@ class WorkerNodeService(molink_pb2_grpc.MolinkServiceServicer):
         t_compute_end = time.perf_counter()
         _log_molink_event(f"{virtual_engine} {prefill_count}P{decode_count}D compute ends ({stage}) at {time.time()}")
 
-        # Route result.
+        compute_ms = (t_compute_end - t_compute_start) * 1000
+        req_ids = list(getattr(scheduler_output, "num_scheduled_tokens", {}).keys())
+        self._record_metric({
+            "type": "tail_compute",
+            "queue_wait_ms": queue_wait_ms,
+            "deserialize_ms": deser_ms,
+            "compute_ms": compute_ms,
+            "virtual_engine": virtual_engine,
+            "timestamp": time.time(),
+            "req_ids": req_ids,
+        })
+
+        return output, scheduler_output, work_item
+
+    async def _push_result(self, output, scheduler_output, work_item):
+        """Serialize output + gRPC push (CPU / I/O only, safe to run in background)."""
+        t_push_start = time.perf_counter()
+        virtual_engine = work_item["virtual_engine"]
+        step_id = work_item.get("step_id", -1)
+        loop = asyncio.get_running_loop()
+
         server_list = self._cached_server_list
         my_address = f"{self._ip}:{self._grpc_port}"
         try:
@@ -446,13 +489,11 @@ class WorkerNodeService(molink_pb2_grpc.MolinkServiceServicer):
             my_idx = len(server_list) - 1
         is_last_stage = (my_idx == len(server_list) - 1)
 
-        # Push result.
-        t_push_start = time.perf_counter()
         t_serialize_result_ms = 0
         t_grpc_send_ms = 0
         output_bytes = b""
         if is_last_stage:
-            _log_molink_event(f"{virtual_engine} {prefill_count}P{decode_count}D trans starts at {time.time()}")
+            _log_molink_event(f"{virtual_engine} 0P0D trans starts at {time.time()}")
             t_ser_start = time.perf_counter()
             output_bytes = await loop.run_in_executor(
                 None, pickle.dumps, output, pickle.HIGHEST_PROTOCOL,
@@ -472,8 +513,6 @@ class WorkerNodeService(molink_pb2_grpc.MolinkServiceServicer):
                 output.tensors if isinstance(output, IntermediateTensors)
                 else {"hidden_states": output}
             )
-            # We don't have the raw scheduler bytes here — pass empty.
-            # This path is unused in our PP=2 setup (tail is always last stage).
             cached_meta = {
                 "head": self._cached_head_server,
                 "server_list": self._cached_server_list,
@@ -484,19 +523,12 @@ class WorkerNodeService(molink_pb2_grpc.MolinkServiceServicer):
         t_push_end = time.perf_counter()
 
         req_ids = list(getattr(scheduler_output, "num_scheduled_tokens", {}).keys())
-
         self._record_metric({
-            "type": "worker_step",
-            "queue_wait_ms": queue_wait_ms,
-            "deserialize_ms": deser_ms,
-            "compute_lock_wait_ms": compute_lock_wait_ms,
-            "compute_ms": (t_compute_end - t_compute_start) * 1000,
+            "type": "tail_push",
             "serialize_result_ms": t_serialize_result_ms,
             "grpc_send_ms": t_grpc_send_ms,
             "push_ms": (t_push_end - t_push_start) * 1000,
-            "total_ms": (time.perf_counter() - t_total_start) * 1000,
             "is_last_stage": is_last_stage,
-            "recv_bytes": recv_bytes,
             "result_bytes": len(output_bytes) if is_last_stage else 0,
             "virtual_engine": virtual_engine,
             "timestamp": time.time(),
