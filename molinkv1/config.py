@@ -48,7 +48,7 @@ class MolinkConfig:
 
 @config(config=ConfigDict(arbitrary_types_allowed=True))
 class VllmConfig1(VllmConfig):
-    molink_config: MolinkConfig = field(default_factory=MolinkConfig)
+    molink_config: Optional[MolinkConfig] = None
 
     def _update_attr(self, molink_config: MolinkConfig):
         self.molink_config = molink_config

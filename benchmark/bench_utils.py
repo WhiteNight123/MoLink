@@ -167,6 +167,14 @@ def cleanup() -> None:
             pass
         ssh_tunnel_pid = None
 
+    # Clear instrument event logs on both machines so they don't
+    # accumulate across repeated runs (append-only files).
+    subprocess.run(["rm", "-f", "/tmp/molink_worker_events.log"], capture_output=True)
+    subprocess.run(
+        SSH_CMD + ["rm -f /tmp/molink_worker_events.log"],
+        capture_output=True, timeout=10,
+    )
+
     for port in [HEAD_PORT, VLLM_FWD_PORT, TAIL_PORT, MOLINK_GRPC_HEAD, MOLINK_GRPC_TAIL]:
         try:
             result = subprocess.run(

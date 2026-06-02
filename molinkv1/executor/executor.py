@@ -173,9 +173,6 @@ class MolinkExecutor(MultiprocExecutor):
     def max_concurrent_batches(self) -> int:
         config = self.molink_config
         result = config.max_concurrent_batches if config is not None else 1
-        if (config is not None and config.is_head_node
-                and config.get_serving_layers()[1] != -1):
-            result = max(2, result)
         return result
 
     def __init__(self, vllm_config: VllmConfig, monitor_workers: bool = True):

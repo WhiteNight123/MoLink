@@ -48,6 +48,7 @@ PORT_MAP = {"head": HEAD_PORT, "tail": TAIL_PORT}
 INPUT_TOKENS = 256
 OUTPUT_TOKENS = 8
 MAX_MODEL_LEN = 4096
+MOLINK_MAX_CONCURRENT_BATCHES = 1
 HEALTH_TIMEOUT = 300
 COOLDOWN = 5
 
@@ -185,7 +186,7 @@ def wait_health(url, timeout=HEALTH_TIMEOUT, container_name=None, log_file=None)
 
 # ── MoLink ─────────────────────────────────────────────────────────────────
 
-def start_molink(head_node, tail_node):
+def start_molink(head_node, tail_node, max_ve):
     log("Starting MoLink head...")
     env = {
         "PYTHONPATH": MOLINK_CODE,
@@ -198,7 +199,7 @@ def start_molink(head_node, tail_node):
         f"--enforce-eager --no-enable-prefix-caching "
         f"--molink-grpc-port {GRPC_PORTS['head']} "
         f"--molink-start-layer 0 --molink-end-layer 21 "
-        f"--molink-enable-metrics --molink-max-concurrent-batches 2 "
+        f"--molink-enable-metrics --molink-max-concurrent-batches {max_ve} "
         f"--port {HEAD_PORT}"
     )
     _dexec(head_node["name"], head_cmd + " &>/tmp/bench_head.log", detach=True, env=env)
@@ -216,7 +217,7 @@ def start_molink(head_node, tail_node):
         f"--enforce-eager --no-enable-prefix-caching "
         f"--molink-grpc-port {GRPC_PORTS['tail']} "
         f"--molink-start-layer 21 --molink-end-layer -1 "
-        f"--molink-enable-metrics --molink-max-concurrent-batches 2 "
+        f"--molink-enable-metrics --molink-max-concurrent-batches {max_ve} "
         f"--molink-initial-peer {head_node['ip']}:{GRPC_PORTS['head']} "
         f"--port {TAIL_PORT}"
     )
@@ -341,7 +342,7 @@ def run_benchmark(system, url, outdir, model=None, tokenizer=None):
         "--type", "molink" if system == "molink" else "vllm",
         "--input-tokens", str(INPUT_TOKENS),
         "--output-tokens", str(OUTPUT_TOKENS),
-        "--rps", "2",
+        "--rps", "1",
         "--duration", "1",
         "--model", model or MODEL_PATH,
         "--tokenizer", tokenizer or HOST_TOKENIZER,
@@ -441,7 +442,7 @@ def wait_health_remote(port, timeout=HEALTH_TIMEOUT):
     return False
 
 
-def start_molink_distributed(gpu, remote_gpu, log_dir):
+def start_molink_distributed(gpu, remote_gpu, log_dir, max_ve):
     """Start MoLink head locally + tail remotely."""
     log_dir = Path(log_dir)
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -455,7 +456,7 @@ def start_molink_distributed(gpu, remote_gpu, log_dir):
          "--molink-grpc-port", str(GRPC_PORTS["head"]),
          "--molink-start-layer", "0",
          "--molink-end-layer", str(_bu.HEAD_END_LAYER),
-         "--molink-max-concurrent-batches", "2",
+         "--molink-max-concurrent-batches", str(max_ve),
          "--port", str(HEAD_PORT)],
         background=True, gpu=gpu,
         log_path=str(log_dir / "server.log"),
@@ -478,7 +479,7 @@ def start_molink_distributed(gpu, remote_gpu, log_dir):
         f"--enforce-eager --no-enable-prefix-caching "
         f"--molink-grpc-port {GRPC_PORTS['tail']} "
         f"--molink-start-layer {_bu.TAIL_START_LAYER} --molink-end-layer -1 "
-        f"--molink-max-concurrent-batches 2 "
+        f"--molink-max-concurrent-batches {max_ve} "
         f"--port {TAIL_PORT} "
         f"--molink-initial-peer {_bu.LOCAL_IP}:{GRPC_PORTS['head']}",
         background=True,
@@ -615,6 +616,9 @@ def parse_args():
     ap.add_argument("--remote-gpu", default="0", help="Remote GPU device (distributed mode)")
     ap.add_argument("--network", default="1gbit,10ms",
                     help="Network condition: bandwidth,latency or 'none' (Docker mode)")
+    ap.add_argument("--molink-max-concurrent-batches", type=int,
+                    default=MOLINK_MAX_CONCURRENT_BATCHES,
+                    help=f"MoLink max concurrent batches (default: {MOLINK_MAX_CONCURRENT_BATCHES})")
     ap.add_argument("--output", default=None, help="Results directory")
     return ap.parse_args()
 
@@ -694,7 +698,7 @@ def main_docker(args, systems):
                     _dexec(node["name"], "rm -f /tmp/molink_worker_events.log")
 
             if system == "molink":
-                start_molink(nodes[0], nodes[1])
+                start_molink(nodes[0], nodes[1], args.molink_max_concurrent_batches)
                 url = f"http://localhost:{HEAD_PORT}/generate"
             elif system == "vllm":
                 start_vllm(nodes)
@@ -762,7 +766,7 @@ def main_distributed(args, systems):
             plot_dir = system_dir / "plots"
 
             if system == "molink":
-                start_molink_distributed(gpu, remote_gpu, log_dir)
+                start_molink_distributed(gpu, remote_gpu, log_dir, args.molink_max_concurrent_batches)
                 url = f"http://localhost:{HEAD_PORT}/generate"
                 model = _bu.LOCAL_MODEL
                 tokenizer = _bu.LOCAL_TOKENIZER
