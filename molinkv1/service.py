@@ -13,6 +13,13 @@ from typing import TYPE_CHECKING
 from vllm.logger import init_logger
 
 from molinkv1.comm import molink_pb2, molink_pb2_grpc
+
+_MOLINK_LOG = "/tmp/molink_worker_events.log"
+
+
+def _log_molink_event(msg):
+    with open(_MOLINK_LOG, "a") as _f:
+        _f.write(msg + "\n")
 from molinkv1.utils import PipelineTopology, deserialize_metadata
 
 if TYPE_CHECKING:
@@ -198,7 +205,7 @@ class MolinkService(molink_pb2_grpc.MolinkServiceServicer):
             virtual_engine = request.virtual_engine
             output_bytes = request.output_data
 
-            print(f"{virtual_engine} 0 back to head at {time.time()}", flush=True)
+            _log_molink_event(f"{virtual_engine} 0P0D back to head at {time.time()}")
             await self.output_queue[virtual_engine].put(output_bytes)
 
             self._record_metric({

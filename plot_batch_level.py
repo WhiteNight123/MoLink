@@ -82,14 +82,15 @@ def parse_log_file(filename, log_type):
                 request_events[timestamp].append(('finished', request_id))
                 continue
 
-            # --- 匹配常规事件行: "0 1 compute starts (prefill) at 1761024538.0907214"
-            # 支持可选的 batch_size 和可选的阶段括号
-            match = re.match(r'(\d+)(?:\s+(\d+))?\s+(.+?)\s+at\s+([\d.]+)$', line)
+            # --- 匹配常规事件行: "0 1P0D compute starts (prefill) at 1761024538.0907214"
+            # or legacy: "0 1 compute starts (prefill) at 1761024538.0907214"
+            # 支持可选的 batch_spec (xPxD 或纯数字) 和可选的阶段括号
+            match = re.match(r'(\d+)(?:\s+(\d+(?:P\d+D)?))?\s+(.+?)\s+at\s+([\d.]+)$', line)
             if not match:
                 continue
-                
+
             batch_id = int(match.group(1))
-            batch_size = match.group(2)
+            batch_spec = match.group(2)
             event_desc = match.group(3).strip()
             timestamp = float(match.group(4))
 
@@ -97,9 +98,18 @@ def parse_log_file(filename, log_type):
             stage_match = re.search(r'\(([^)]+)\)', event_desc)
             stage = stage_match.group(1) if stage_match else None
 
-            # 规范化 batch_size
-            if batch_size:
-                batch_size = int(batch_size)
+            # 解析 batch_spec: "3P2D" 或纯数字 "5"
+            prefill_val = 0
+            decode_val = 0
+            batch_size = 0
+            if batch_spec:
+                xpd_match = re.match(r'(\d+)P(\d+)D', batch_spec)
+                if xpd_match:
+                    prefill_val = int(xpd_match.group(1))
+                    decode_val = int(xpd_match.group(2))
+                    batch_size = prefill_val + decode_val
+                else:
+                    batch_size = int(batch_spec)
             else:
                 # 尝试从事件描述中提取 batch size（若像 "8 compute starts" 的情况）
                 size_match = re.search(r'(\d+)\s+compute starts', event_desc)
@@ -122,13 +132,17 @@ def parse_log_file(filename, log_type):
                 event_type = 'serial_end'
             elif "back to head" in event_desc:
                 event_type = 'back_to_head'
+            elif "sample starts" in event_desc:
+                event_type = 'sample_start'
+            elif "sample ends" in event_desc:
+                event_type = 'sample_end'
             elif "recv" in event_desc:
                 event_type = 'recv'
             else:
                 continue  # 忽略未知事件类型
 
-            # 存储为四元组，stage 可能为 None
-            events[batch_id].append((event_type, timestamp, batch_size or 0, stage))
+            # 存储为六元组，兼容旧格式
+            events[batch_id].append((event_type, timestamp, batch_size, stage, prefill_val, decode_val))
             
     return events, request_events
 
@@ -142,13 +156,13 @@ server2_events, server2_requests = parse_log_file('server2.log', 'server2')
 all_timestamps = []
 for batch_id, events in server1_events.items():
     print(f"Server1 Batch {batch_id} 事件:")
-    for event_type, ts, size, stage in events:
+    for event_type, ts, size, stage, *_ in events:
         print(f"  {event_type} ({stage}) at {ts}")
         all_timestamps.append(ts)
 
 for batch_id, events in server2_events.items():
     print(f"Server2 Batch {batch_id} 事件:")
-    for event_type, ts, size, stage in events:
+    for event_type, ts, size, stage, *_ in events:
         print(f"  {event_type} ({stage}) at {ts}")
         all_timestamps.append(ts)
 
@@ -264,42 +278,42 @@ def draw_request_events(request_events):
 def draw_compute_segments(events, resource_level, is_server1=True):
     for batch_id, batch_events in events.items():
         # 收集所有计算开始和结束事件，按阶段配对
-        compute_starts = [(ts, size, stage) for etype, ts, size, stage in batch_events if etype == 'compute_start']
-        compute_ends = [(ts, stage) for etype, ts, _, stage in batch_events if etype == 'compute_end']
-        
+        compute_starts = [(ts, size, stage, prefill, decode) for etype, ts, size, stage, prefill, decode in batch_events if etype == 'compute_start']
+        compute_ends = [(ts, stage) for etype, ts, _, stage, _, _ in batch_events if etype == 'compute_end']
+
         # 按时间排序以确保正确匹配
         compute_starts.sort(key=lambda x: x[0])
         compute_ends.sort(key=lambda x: x[0])
-        
+
         # 对于可能存在的阶段匹配逻辑，我们按出现顺序配对：第 i 个 start 对应第 i 个 end（如果阶段相同则最好）
         min_count = min(len(compute_starts), len(compute_ends))
         if len(compute_starts) != len(compute_ends):
             print(f"警告: Batch {batch_id} 的计算开始({len(compute_starts)})和结束({len(compute_ends)})事件数量不匹配，取最小值 {min_count} 进行匹配")
             compute_starts = compute_starts[:min_count]
             compute_ends = compute_ends[:min_count]
-        
-        for (start, batch_size, start_stage), (end, end_stage) in zip(compute_starts, compute_ends):
+
+        for (start, batch_size, start_stage, prefill_val, decode_val), (end, end_stage) in zip(compute_starts, compute_ends):
             # 优先使用 start_stage，如果为空使用 end_stage
             stage = start_stage or end_stage
             norm_start_ts = normalize(start)
             norm_end_ts = normalize(end)
-            
+
             # 检查是否在时间范围内
             if norm_end_ts > norm_start and norm_start_ts < norm_end:
                 # 计算实际显示的起始点和结束点
                 display_start = max(norm_start_ts, norm_start)
                 display_end = min(norm_end_ts, norm_end)
-                
+
                 # 计算持续时间（毫秒）
                 duration_ms = (end - start) * 1000
-                
+
                 # 选择颜色（保持原色）
                 color = BATCH_COLORS.get(batch_id % len(BATCH_COLORS), '#1f77b4')
-                
+
                 # 计算矩形高度和位置（用 Rectangle 来支持 hatch）
                 bar_height = COMPUTE_BAR_HEIGHT
                 y_bottom = resource_level - bar_height / 2.0
-                
+
                 rect = Rectangle(
                     (display_start, y_bottom),
                     display_end - display_start,
@@ -310,7 +324,7 @@ def draw_compute_segments(events, resource_level, is_server1=True):
                     linewidth=0.5,
                     zorder=2
                 )
-                
+
                 # 根据阶段设置 hatch（不改变颜色）
                 if stage:
                     stage_lower = stage.lower()
@@ -321,22 +335,25 @@ def draw_compute_segments(events, resource_level, is_server1=True):
                     else:
                         # 其他阶段可以使用横线作为示例，但若不想改变就不设置 hatch
                         pass
-                
+
                 ax.add_patch(rect)
-                
+
                 # 添加图例句柄（只添加一次）
                 if batch_id not in [h[0] for h in legend_handles if isinstance(h[0], int)]:
                     legend_handles.append((batch_id, plt.Line2D([0], [0], color=color, lw=4, alpha=ALPHA)))
-                
+
                 # 修改：将文本标注放在计算段下方或者上方
                 mid_x = (display_start + display_end) / 2
-                text = f"bs={batch_size}\n{duration_ms:.1f}ms\n{stage or ''}"
-                
+                if prefill_val > 0 or decode_val > 0:
+                    text = f"{prefill_val}P{decode_val}D\n{duration_ms:.1f}ms\n{stage or ''}"
+                else:
+                    text = f"bs={batch_size}\n{duration_ms:.1f}ms\n{stage or ''}"
+
                 if is_server1:
                     ann_y = resource_level - bar_height/2 - 0.15
                 else:
                     ann_y = resource_level + bar_height/2 + 0.15
-                
+
                 ann = ax.text(
                     mid_x, ann_y, text,
                     ha='center', va='center', fontsize=9,
@@ -351,12 +368,12 @@ def draw_transfer_segments():
     print("\n绘制中间结果传输 (server1 -> server2): trans_start to recv")
     for batch_id in set(list(server1_events.keys()) + list(server2_events.keys())):
         # 获取server1的trans_start事件
-        s1_trans_starts = [ts for etype, ts, _, _ in server1_events.get(batch_id, []) 
+        s1_trans_starts = [ts for etype, ts, *_ in server1_events.get(batch_id, [])
                           if etype == 'trans_start']
         s1_trans_starts.sort()
-        
+
         # 获取server2的recv事件
-        s2_recvs = [ts for etype, ts, _, _ in server2_events.get(batch_id, []) 
+        s2_recvs = [ts for etype, ts, *_ in server2_events.get(batch_id, [])
                    if etype == 'recv']
         s2_recvs.sort()
         
@@ -419,12 +436,12 @@ def draw_transfer_segments():
     print("\n绘制结果返回传输 (server2 -> server1): trans_start to back_to_head")
     for batch_id in set(list(server1_events.keys()) + list(server2_events.keys())):
         # 获取server2的trans_start事件
-        s2_trans_starts = [ts for etype, ts, _, _ in server2_events.get(batch_id, []) 
+        s2_trans_starts = [ts for etype, ts, *_ in server2_events.get(batch_id, [])
                           if etype == 'trans_start']
         s2_trans_starts.sort()
-        
+
         # 获取server1的back_to_head事件
-        s1_backs = [ts for etype, ts, _, _ in server1_events.get(batch_id, []) 
+        s1_backs = [ts for etype, ts, *_ in server1_events.get(batch_id, [])
                    if etype == 'back_to_head']
         s1_backs.sort()
         

@@ -45,8 +45,8 @@ RAY_PORT = 6379
 
 PORT_MAP = {"head": HEAD_PORT, "tail": TAIL_PORT}
 
-INPUT_TOKENS = 512
-OUTPUT_TOKENS = 128
+INPUT_TOKENS = 256
+OUTPUT_TOKENS = 8
 MAX_MODEL_LEN = 4096
 HEALTH_TIMEOUT = 300
 COOLDOWN = 5
@@ -305,12 +305,16 @@ def collect_logs(system, nodes, outdir):
     outdir = Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
     if system == "molink":
-        r = _dexec(nodes[0]["name"], "cat /tmp/bench_head.log 2>/dev/null || true")
+        r = _dexec(nodes[0]["name"], "cat /tmp/molink_worker_events.log 2>/dev/null || true")
         if r.stdout.strip():
             (outdir / "head.log").write_text(r.stdout)
-        r = _dexec(nodes[1]["name"], "cat /tmp/bench_tail.log 2>/dev/null || true")
+        r = _dexec(nodes[1]["name"], "cat /tmp/molink_worker_events.log 2>/dev/null || true")
         if r.stdout.strip():
             (outdir / "tail.log").write_text(r.stdout)
+        # Also collect main serve log for request events
+        r = _dexec(nodes[0]["name"], "cat /tmp/bench_head.log 2>/dev/null || true")
+        if r.stdout.strip():
+            (outdir / "molink.log").write_text(r.stdout)
     elif system == "vllm":
         # Collect worker events from both containers (file-based logging)
         r = _dexec(nodes[0]["name"], "cat /tmp/vllm_worker_events.log 2>/dev/null || true")
@@ -338,7 +342,7 @@ def run_benchmark(system, url, outdir, model=None, tokenizer=None):
         "--input-tokens", str(INPUT_TOKENS),
         "--output-tokens", str(OUTPUT_TOKENS),
         "--rps", "2",
-        "--duration", "10",
+        "--duration", "1",
         "--model", model or MODEL_PATH,
         "--tokenizer", tokenizer or HOST_TOKENIZER,
         "--output", str(outdir / "result.json"),
@@ -438,7 +442,7 @@ def wait_health_remote(port, timeout=HEALTH_TIMEOUT):
 
 
 def start_molink_distributed(gpu, remote_gpu, log_dir):
-    """Start MoLink head locally + tail remotely. Returns remote log path."""
+    """Start MoLink head locally + tail remotely."""
     log_dir = Path(log_dir)
     log_dir.mkdir(parents=True, exist_ok=True)
 
@@ -454,7 +458,7 @@ def start_molink_distributed(gpu, remote_gpu, log_dir):
          "--molink-max-concurrent-batches", "2",
          "--port", str(HEAD_PORT)],
         background=True, gpu=gpu,
-        log_path=str(log_dir / "head.log"),
+        log_path=str(log_dir / "server.log"),
     )
     if not wait_health(f"http://localhost:{HEAD_PORT}/health"):
         die("MoLink head failed to start")
@@ -484,7 +488,6 @@ def start_molink_distributed(gpu, remote_gpu, log_dir):
         die("MoLink tail failed to start on remote")
     log("Tail ready!")
     time.sleep(5)
-    return remote_log
 
 
 def start_vllm_distributed(gpu, remote_gpu, log_dir):
@@ -556,25 +559,31 @@ def start_vllm_distributed(gpu, remote_gpu, log_dir):
     time.sleep(5)
 
 
-def collect_logs_distributed(system, log_dir, remote_molink_log=None):
+def collect_logs_distributed(system, log_dir):
     """Collect logs from local/remote for distributed mode."""
     log_dir = Path(log_dir)
     log_dir.mkdir(parents=True, exist_ok=True)
 
     if system == "molink":
-        # head.log already written locally by run_local
-        if remote_molink_log:
-            r = subprocess.run(
-                ["scp", "-o", "StrictHostKeyChecking=no",
-                 "-P", _bu.REMOTE_PORT,
-                 f"{_bu.REMOTE_USER}@{_bu.REMOTE_HOST}:{remote_molink_log}",
-                 str(log_dir / "tail.log")],
-                capture_output=True, text=True, timeout=30,
-            )
-            if r.returncode == 0:
-                log(f"Remote tail log copied to {log_dir / 'tail.log'}")
-            else:
-                log(f"Failed to copy remote log: {r.stderr[:200]}")
+        # Collect instrument events from /tmp/molink_worker_events.log
+        local_events = Path("/tmp/molink_worker_events.log")
+        if local_events.exists():
+            shutil.copy2(str(local_events), str(log_dir / "head.log"))
+            log(f"Local head events copied to {log_dir / 'head.log'}")
+        else:
+            log("WARNING: /tmp/molink_worker_events.log not found locally")
+
+        r = subprocess.run(
+            ["scp", "-o", "StrictHostKeyChecking=no",
+             "-P", _bu.REMOTE_PORT,
+             f"{_bu.REMOTE_USER}@{_bu.REMOTE_HOST}:/tmp/molink_worker_events.log",
+             str(log_dir / "tail.log")],
+            capture_output=True, text=True, timeout=30,
+        )
+        if r.returncode == 0:
+            log(f"Remote tail events copied to {log_dir / 'tail.log'}")
+        else:
+            log(f"Failed to copy remote events: {r.stderr[:200]}")
 
     elif system == "vllm":
         local_events = Path("/tmp/vllm_worker_events.log")
@@ -647,7 +656,8 @@ def main_docker(args, systems):
         "gpus": gpu_devs,
         "input_tokens": INPUT_TOKENS,
         "output_tokens": OUTPUT_TOKENS,
-        "concurrent_requests": 3,
+        "rps": 2,
+        "duration_s": 10,
         "network": args.network,
     }
     (results_dir / "config.json").write_text(json.dumps(config, indent=2))
@@ -681,6 +691,7 @@ def main_docker(args, systems):
                     _dexec(node["name"],
                            f"find {MOLINK_CODE} -name '__pycache__' -type d "
                            f"-exec rm -rf {{}} + 2>/dev/null || true")
+                    _dexec(node["name"], "rm -f /tmp/molink_worker_events.log")
 
             if system == "molink":
                 start_molink(nodes[0], nodes[1])
@@ -750,9 +761,8 @@ def main_distributed(args, systems):
             log_dir = system_dir / "logs"
             plot_dir = system_dir / "plots"
 
-            remote_molink_log = None
             if system == "molink":
-                remote_molink_log = start_molink_distributed(gpu, remote_gpu, log_dir)
+                start_molink_distributed(gpu, remote_gpu, log_dir)
                 url = f"http://localhost:{HEAD_PORT}/generate"
                 model = _bu.LOCAL_MODEL
                 tokenizer = _bu.LOCAL_TOKENIZER
@@ -765,7 +775,7 @@ def main_distributed(args, systems):
                 die(f"Unknown system: {system}")
 
             run_benchmark(system, url, system_dir, model=model, tokenizer=tokenizer)
-            collect_logs_distributed(system, log_dir, remote_molink_log=remote_molink_log)
+            collect_logs_distributed(system, log_dir)
             generate_plot(system, log_dir, plot_dir)
 
             log(f"Done: {system_dir}")

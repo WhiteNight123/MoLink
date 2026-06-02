@@ -34,6 +34,13 @@ from molinkv1.config import MolinkConfig
 from molinkv1.engine.engine import MolinkEngine
 logger = init_logger("vllm.entrypoints.api_server")
 
+_MOLINK_LOG = "/tmp/molink_worker_events.log"
+
+
+def _log_molink_event(msg):
+    with open(_MOLINK_LOG, "a") as _f:
+        _f.write(msg + "\n")
+
 app = FastAPI()
 engine = None
 
@@ -151,7 +158,7 @@ async def _generate(request_dict: dict, raw_request: Request) -> Response:
     request_id = random_uuid()
 
     assert engine is not None
-    print(f"request {request_id} is added at {_time.time()}", flush=True)
+    _log_molink_event(f"request {request_id} is added at {_time.time()}")
     results_generator = engine.generate(prompt, sampling_params, request_id)
 
     # Streaming case
@@ -164,7 +171,7 @@ async def _generate(request_dict: dict, raw_request: Request) -> Response:
                 ret = {"text": text_outputs}
                 yield (json.dumps(ret) + "\n").encode("utf-8")
         finally:
-            print(f"request {request_id} finished at {_time.time()}", flush=True)
+            _log_molink_event(f"request {request_id} finished at {_time.time()}")
 
     if stream:
         return StreamingResponse(stream_results())
@@ -182,7 +189,7 @@ async def _generate(request_dict: dict, raw_request: Request) -> Response:
     assert prompt is not None
     text_outputs = [prompt + output.text for output in final_output.outputs]
     ret = {"text": text_outputs}
-    print(f"request {request_id} finished at {_time.time()}", flush=True)
+    _log_molink_event(f"request {request_id} finished at {_time.time()}")
     return JSONResponse(ret)
 
 

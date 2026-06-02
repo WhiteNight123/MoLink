@@ -18,6 +18,13 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, Optional
 
 import cloudpickle
+
+_MOLINK_LOG = "/tmp/molink_worker_events.log"
+
+
+def _log_molink_event(msg):
+    with open(_MOLINK_LOG, "a") as _f:
+        _f.write(msg + "\n")
 import grpc.aio as aio
 import numpy as np
 import torch
@@ -404,9 +411,11 @@ class WorkerNodeService(molink_pb2_grpc.MolinkServiceServicer):
         # GPU compute (serialized — model runner is not concurrent-safe).
         num_tokens = scheduler_output.total_num_scheduled_tokens
         num_reqs = len(scheduler_output.num_scheduled_tokens)
+        prefill_count = len(getattr(scheduler_output, 'scheduled_new_reqs', []) or [])
+        decode_count = num_reqs - prefill_count
         has_new = bool(getattr(scheduler_output, 'scheduled_new_reqs', None))
         stage = "prefill" if has_new else "decode"
-        print(f"{virtual_engine} {num_reqs} compute starts ({stage}) at {time.time()}", flush=True)
+        _log_molink_event(f"{virtual_engine} {prefill_count}P{decode_count}D compute starts ({stage}) at {time.time()}")
         t_compute_start = time.perf_counter()
         compute_lock_wait_ms = 0
         try:
@@ -426,7 +435,7 @@ class WorkerNodeService(molink_pb2_grpc.MolinkServiceServicer):
             if output is None:
                 raise
         t_compute_end = time.perf_counter()
-        print(f"{virtual_engine} {num_reqs} compute ends ({stage}) at {time.time()}", flush=True)
+        _log_molink_event(f"{virtual_engine} {prefill_count}P{decode_count}D compute ends ({stage}) at {time.time()}")
 
         # Route result.
         server_list = self._cached_server_list
@@ -443,7 +452,7 @@ class WorkerNodeService(molink_pb2_grpc.MolinkServiceServicer):
         t_grpc_send_ms = 0
         output_bytes = b""
         if is_last_stage:
-            print(f"{virtual_engine} {num_reqs} trans starts at {time.time()}", flush=True)
+            _log_molink_event(f"{virtual_engine} {prefill_count}P{decode_count}D trans starts at {time.time()}")
             t_ser_start = time.perf_counter()
             output_bytes = await loop.run_in_executor(
                 None, pickle.dumps, output, pickle.HIGHEST_PROTOCOL,
@@ -552,7 +561,7 @@ class WorkerNodeService(molink_pb2_grpc.MolinkServiceServicer):
         await self._work_queue.put(work_item)
 
         ve = request.virtual_engine
-        print(f"{ve} 0 recv at {time.time()}", flush=True)
+        _log_molink_event(f"{ve} 0P0D recv at {time.time()}")
 
         self._record_metric({
             "type": "tail_recv",

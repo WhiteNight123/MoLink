@@ -89,13 +89,14 @@ def parse_log_file(filename):
                 request_events[float(m.group(2))].append(("finished", m.group(1)))
                 continue
 
-            # Batch event: "0 1 compute starts (prefill) at 1234.56"
-            m = re.match(r"(\d+)(?:\s+(\d+))?\s+(.+?)\s+at\s+([\d.]+)$", line)
+            # Batch event: "0 1P0D compute starts (prefill) at 1234.56"
+            # or legacy: "0 1 compute starts (prefill) at 1234.56"
+            m = re.match(r"(\d+)(?:\s+(\d+(?:P\d+D)?))?\s+(.+?)\s+at\s+([\d.]+)$", line)
             if not m:
                 continue
 
             batch_id = int(m.group(1))
-            batch_size = m.group(2)
+            batch_spec = m.group(2)
             event_desc = m.group(3).strip()
             timestamp = float(m.group(4))
 
@@ -103,7 +104,18 @@ def parse_log_file(filename):
             stage_match = re.search(r"\(([^)]+)\)", event_desc)
             stage = stage_match.group(1) if stage_match else None
 
-            batch_size_val = int(batch_size) if batch_size else 0
+            # Parse batch spec: "3P2D" → prefill=3, decode=2; or legacy "5" → batch_size=5
+            prefill_val = 0
+            decode_val = 0
+            batch_size_val = 0
+            if batch_spec:
+                xpd_match = re.match(r"(\d+)P(\d+)D", batch_spec)
+                if xpd_match:
+                    prefill_val = int(xpd_match.group(1))
+                    decode_val = int(xpd_match.group(2))
+                    batch_size_val = prefill_val + decode_val
+                else:
+                    batch_size_val = int(batch_spec)
 
             # Classify event type
             if "compute starts" in event_desc:
@@ -120,12 +132,16 @@ def parse_log_file(filename):
                 etype = "serial_end"
             elif "back to head" in event_desc:
                 etype = "back_to_head"
+            elif "sample starts" in event_desc:
+                etype = "sample_start"
+            elif "sample ends" in event_desc:
+                etype = "sample_end"
             elif "recv" in event_desc:
                 etype = "recv"
             else:
                 continue
 
-            events[batch_id].append((etype, timestamp, batch_size_val, stage))
+            events[batch_id].append((etype, timestamp, batch_size_val, stage, prefill_val, decode_val))
 
     return events, request_events
 
@@ -134,12 +150,12 @@ def parse_log_file(filename):
 
 def draw_compute_segments(events, resource_level, ax, norm_start, norm_end, base_time, is_top=True):
     for batch_id, batch_events in events.items():
-        starts = [(ts, size, stage) for etype, ts, size, stage in batch_events if etype == "compute_start"]
-        ends = [(ts, stage) for etype, ts, _, stage in batch_events if etype == "compute_end"]
+        starts = [(ts, size, stage, prefill, decode) for etype, ts, size, stage, prefill, decode in batch_events if etype == "compute_start"]
+        ends = [(ts, stage) for etype, ts, _, stage, _, _ in batch_events if etype == "compute_end"]
         starts.sort(key=lambda x: x[0])
         ends.sort(key=lambda x: x[0])
 
-        for (start, batch_size, stage), (end, _) in zip(starts, ends):
+        for (start, batch_size, stage, prefill_val, decode_val), (end, _) in zip(starts, ends):
             norm_start_ts = start - base_time
             norm_end_ts = end - base_time
 
@@ -165,7 +181,10 @@ def draw_compute_segments(events, resource_level, ax, norm_start, norm_end, base
                 ax.add_patch(rect)
 
                 mid_x = (display_start + display_end) / 2
-                text = f"bs={batch_size}\n{duration_ms:.0f}ms\n{stage or ''}"
+                if prefill_val > 0 or decode_val > 0:
+                    text = f"{prefill_val}P{decode_val}D\n{duration_ms:.0f}ms\n{stage or ''}"
+                else:
+                    text = f"bs={batch_size}\n{duration_ms:.0f}ms\n{stage or ''}"
                 ann_y = resource_level - COMPUTE_BAR_HEIGHT / 2 - 0.2 if is_top else resource_level + COMPUTE_BAR_HEIGHT / 2 + 0.2
                 ax.text(mid_x, ann_y, text, ha="center", va="center", fontsize=8,
                         bbox=dict(facecolor="white", alpha=0.8, edgecolor="gray", boxstyle="round,pad=0.2"))
@@ -175,8 +194,8 @@ def draw_transfers(s1_events, s2_events, ax, norm_start, norm_end, base_time):
     """Match trans_start in one server's log to recv/back_to_head in the other."""
     for batch_id in set(list(s1_events.keys()) + list(s2_events.keys())):
         # Server1 → Server2: trans_start (s1) → recv (s2)
-        s1_trans = [ts for etype, ts, _, _ in s1_events.get(batch_id, []) if etype == "trans_start"]
-        s2_recv = [ts for etype, ts, _, _ in s2_events.get(batch_id, []) if etype == "recv"]
+        s1_trans = [ts for etype, ts, *_ in s1_events.get(batch_id, []) if etype == "trans_start"]
+        s2_recv = [ts for etype, ts, *_ in s2_events.get(batch_id, []) if etype == "recv"]
         s1_trans.sort()
         s2_recv.sort()
 
@@ -201,8 +220,8 @@ def draw_transfers(s1_events, s2_events, ax, norm_start, norm_end, base_time):
                         bbox=dict(facecolor="white", alpha=0.8, edgecolor="gray", boxstyle="round,pad=0.2"))
 
         # Server2 → Server1: trans_start (s2) → back_to_head (s1)
-        s2_trans = [ts for etype, ts, _, _ in s2_events.get(batch_id, []) if etype == "trans_start"]
-        s1_back = [ts for etype, ts, _, _ in s1_events.get(batch_id, []) if etype == "back_to_head"]
+        s2_trans = [ts for etype, ts, *_ in s2_events.get(batch_id, []) if etype == "trans_start"]
+        s1_back = [ts for etype, ts, *_ in s1_events.get(batch_id, []) if etype == "back_to_head"]
         s2_trans.sort()
         s1_back.sort()
 
@@ -275,7 +294,7 @@ def plot_timeline(s1_events, s2_events, request_events_dict, output_path, title,
     all_ts = []
     for evts in [s1_events, s2_events]:
         for batch_evts in evts.values():
-            for _, ts, _, _ in batch_evts:
+            for _, ts, *_ in batch_evts:
                 all_ts.append(ts)
     for ts in request_events_dict:
         all_ts.append(ts)
@@ -366,11 +385,13 @@ def _plot_vllm(logdir, outdir, time_range):
         return
 
     print(f"Parsing vLLM head log: {head_log}")
-    s1_events, _ = parse_log_file(str(head_log))
+    s1_events, req1 = parse_log_file(str(head_log))
     print(f"Parsing vLLM tail log: {tail_log}")
     s2_events, _ = parse_log_file(str(tail_log))
 
     request_events = defaultdict(list)
+    for ts, evts in req1.items():
+        request_events[ts].extend(evts)
     vllm_log = logdir / "vllm.log"
     if vllm_log.exists():
         _, req_events = parse_log_file(str(vllm_log))

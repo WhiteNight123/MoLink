@@ -18,6 +18,13 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import cloudpickle
+
+_MOLINK_LOG = "/tmp/molink_worker_events.log"
+
+
+def _log_molink_event(msg):
+    with open(_MOLINK_LOG, "a") as _f:
+        _f.write(msg + "\n")
 import grpc.aio as aio
 import torch
 
@@ -436,23 +443,25 @@ class MolinkExecutor(MultiprocExecutor):
                 self._virtual_engine_counter = (self._virtual_engine_counter + 1) % max_ve
                 num_tokens = scheduler_output.total_num_scheduled_tokens
                 num_reqs = len(scheduler_output.num_scheduled_tokens)
+                prefill_count = len(getattr(scheduler_output, 'scheduled_new_reqs', []) or [])
+                decode_count = num_reqs - prefill_count
                 # Determine stage: prefill (new reqs) or decode
                 has_new = bool(getattr(scheduler_output, 'scheduled_new_reqs', None))
                 stage = "prefill" if has_new else "decode"
-                print(f"{virtual_engine} {num_reqs} compute starts ({stage}) at {time.time()}", flush=True)
+                _log_molink_event(f"{virtual_engine} {prefill_count}P{decode_count}D compute starts ({stage}) at {time.time()}")
                 # Always run head compute synchronously so intermediate
                 # tensors are ready before sample_tokens.
                 result = super().execute_model(scheduler_output, non_block=False)
                 t_after_compute = time.perf_counter()
                 head_compute_ms = (t_after_compute - t_start) * 1000
-                print(f"{virtual_engine} {num_reqs} compute ends ({stage}) at {time.time()}", flush=True)
+                _log_molink_event(f"{virtual_engine} {prefill_count}P{decode_count}D compute ends ({stage}) at {time.time()}")
                 # Retrieve intermediate tensors immediately in the engine
                 # thread to avoid RPC races with _do_pipeline coroutines.
                 tensors_result = MultiprocExecutor.collective_rpc(
                     self, "_molink_get_intermediate_tensors")
                 intermediate = (tensors_result[0] if isinstance(tensors_result, list)
                                else tensors_result)
-                print(f"{virtual_engine} {num_reqs} trans starts at {time.time()}", flush=True)
+                _log_molink_event(f"{virtual_engine} {prefill_count}P{decode_count}D trans starts at {time.time()}")
                 # Submit cross-node pipeline to event loop IMMEDIATELY so
                 # gRPC serialization/transfer starts before sample_tokens
                 # is even called.  This lets head GPU compute for batch
