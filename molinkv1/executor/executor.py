@@ -164,6 +164,63 @@ def _serialize_combined(scheduler_pickle: bytes, tensors: Dict[str, torch.Tensor
     return bytes(buf)
 
 
+def _serialize_combined_cpu(scheduler_pickle: bytes, tensors: Dict[str, torch.Tensor]) -> bytes:
+    """Same as _serialize_combined but tensors are already on CPU.
+
+    Callers must ensure D2H copies have completed (e.g. via CUDA event sync)
+    before calling this function.
+    """
+    entries: list[tuple[bytes, bytes]] = []
+
+    sched_header = struct.pack("<Q", len(scheduler_pickle))
+    num_tensors_header = struct.pack("<I", len(tensors))
+    total = len(sched_header) + len(scheduler_pickle) + len(num_tensors_header)
+
+    for key, tensor in tensors.items():
+        tensor_cpu = tensor.detach()  # already on CPU, just strip autograd
+        shape = tensor_cpu.shape
+        ndim = len(shape)
+        dtype_str = str(tensor_cpu.dtype)
+        dtype_bytes = dtype_str.encode("ascii")
+
+        if tensor_cpu.dtype == torch.bfloat16:
+            t_bf = tensor_cpu.contiguous()
+            raw = t_bf.view(torch.uint8).numpy().tobytes() if t_bf.dim() != 0 \
+                else t_bf.unsqueeze(0).view(torch.uint8).numpy().tobytes()
+        else:
+            raw = tensor_cpu.numpy().tobytes()
+
+        header_size = 4 + ndim * 8 + 4 + len(dtype_bytes)
+        td_len = header_size + len(raw)
+        key_bytes = key.encode("ascii")
+        total += 4 + len(key_bytes) + 8 + td_len
+
+        tensor_data = bytearray(td_len)
+        off = 0
+        struct.pack_into("<I", tensor_data, off, ndim); off += 4
+        for dim in shape:
+            struct.pack_into("<Q", tensor_data, off, dim); off += 8
+        struct.pack_into("<I", tensor_data, off, len(dtype_bytes)); off += 4
+        tensor_data[off:off + len(dtype_bytes)] = dtype_bytes; off += len(dtype_bytes)
+        tensor_data[off:off + len(raw)] = raw
+
+        entries.append((key_bytes, bytes(tensor_data)))
+
+    buf = bytearray(total)
+    off = 0
+    buf[off:off + len(sched_header)] = sched_header; off += len(sched_header)
+    buf[off:off + len(scheduler_pickle)] = scheduler_pickle; off += len(scheduler_pickle)
+    buf[off:off + len(num_tensors_header)] = num_tensors_header; off += len(num_tensors_header)
+
+    for key_bytes, tensor_data in entries:
+        struct.pack_into("<I", buf, off, len(key_bytes)); off += 4
+        buf[off:off + len(key_bytes)] = key_bytes; off += len(key_bytes)
+        struct.pack_into("<Q", buf, off, len(tensor_data)); off += 8
+        buf[off:off + len(tensor_data)] = tensor_data; off += len(tensor_data)
+
+    return bytes(buf)
+
+
 class MolinkExecutor(MultiprocExecutor):
     """Executor for cross-node pipeline parallelism using gRPC."""
 
@@ -210,6 +267,10 @@ class MolinkExecutor(MultiprocExecutor):
 
         # Thread pool for gRPC calls
         self._executor_pool = ThreadPoolExecutor(max_workers=16)
+
+        # CUDA stream + event for async D2H copies (lazy-init on first use).
+        self._copy_stream: Optional[torch.cuda.Stream] = None
+        self._copy_event: Optional[torch.cuda.Event] = None
 
         # Per-VE pipeline futures: execute_model submits the cross-node
         # pipeline to the event loop immediately after head compute, so
@@ -374,16 +435,35 @@ class MolinkExecutor(MultiprocExecutor):
         virtual_engine: int,
         next_server: str,
     ) -> None:
-        """Serialize and send intermediate tensors + scheduler_output to the next stage.
+        """Serialize and send intermediate tensors + scheduler_output.
 
-        All CPU-bound serialization (pickle + tensor copies) runs in a single
-        thread-pool call; the gRPC call is awaited to detect failures early.
+        D2H copies are issued asynchronously on a dedicated CUDA stream so
+        the default stream is immediately free for the next batch's compute.
+        CPU serialization (pickle + byte packing) runs in a thread-pool after
+        the copy event synchronizes.
         """
         loop = asyncio.get_running_loop()
 
+        # Lazy-init copy stream / event (CUDA context is ready by first call).
+        if self._copy_stream is None:
+            self._copy_stream = torch.cuda.Stream()
+            self._copy_event = torch.cuda.Event()
+
+        # Phase 1: submit async GPU→CPU copies on the copy stream.
+        main_stream = torch.cuda.current_stream()
+        self._copy_stream.wait_stream(main_stream)
+        with torch.cuda.stream(self._copy_stream):
+            cpu_tensors = {
+                name: t.detach().to("cpu", non_blocking=True)
+                for name, t in tensors.items()
+            }
+        self._copy_event.record(self._copy_stream)
+
+        # Phase 2: CPU serialization in thread pool (blocks on copy_event).
         def _prepare_request():
+            self._copy_event.synchronize()
             sched_bytes = pickle.dumps(scheduler_output, pickle.HIGHEST_PROTOCOL)
-            combined = _serialize_combined(sched_bytes, tensors)
+            combined = _serialize_combined_cpu(sched_bytes, cpu_tensors)
             return molink_pb2.GrpcRequestData(
                 scheduler_output=combined,
                 grpc_metadata=grpc_metadata_bytes,
